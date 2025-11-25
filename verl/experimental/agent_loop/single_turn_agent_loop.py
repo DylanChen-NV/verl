@@ -16,6 +16,7 @@ import logging
 import os
 from typing import Any
 from uuid import uuid4
+import nvtx
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
@@ -62,10 +63,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 ),
             )
 
+        nvtx.push_range("single_turn_agent_loop.generate()", color="green")
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
                 request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
             )
+        nvtx.pop_range()
         response_mask = [1] * len(output.token_ids)
 
         output = AgentLoopOutput(
@@ -77,4 +80,5 @@ class SingleTurnAgentLoop(AgentLoopBase):
             num_turns=2,
             metrics=metrics,
         )
+        # print("single_turn_agent_loop server_manager", self.server_manager) # AsyncLLMServerManage
         return output

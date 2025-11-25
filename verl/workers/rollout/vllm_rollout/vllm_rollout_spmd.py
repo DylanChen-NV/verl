@@ -51,6 +51,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, LoRAConfig
 from vllm.lora.request import LoRARequest
+import nvtx
 
 try:
     # https://github.com/vllm-project/vllm/commit/96b9aa5aa076e64c68765232aec343e4d0006e2a
@@ -580,6 +581,7 @@ class vLLMAsyncRollout(BaseRollout):
 
     def _init_worker(self, all_kwargs: list[dict[str, Any]]):
         """Initialize worker engine."""
+        nvtx.push_range("vLLMAsyncRollout._init_worker()", color="blue")
         if not torch.distributed.is_initialized():
             initialize_global_process_group_ray()
         all_kwargs[0]["rank"] = int(os.environ["RANK"])
@@ -595,10 +597,13 @@ class vLLMAsyncRollout(BaseRollout):
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
+        nvtx.pop_range()
 
     def _load_model(self, *args, **kwargs):
+        nvtx.push_range("vLLMAsyncRollout._load_model()", color="blue")
         self.inference_engine.load_model(*args, **kwargs)
         _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
+        nvtx.pop_range()
 
     async def _execute_method(self, method: str | bytes, *args, **kwargs):
         if method == "init_worker":
@@ -616,13 +621,17 @@ class vLLMAsyncRollout(BaseRollout):
         Args:
             tags: weights or kv_cache.
         """
+        nvtx.push_range("vLLMAsyncRollout.resume()", color="blue")
         if self.config.free_cache_engine:
             self.inference_engine.wake_up(tags=tags)
+        nvtx.pop_range()
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
+        nvtx.push_range("vLLMAsyncRollout.release()", color="blue")
         if self.config.free_cache_engine:
             self.inference_engine.sleep(level=self.sleep_level)
+        nvtx.pop_range()
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -630,6 +639,7 @@ class vLLMAsyncRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        nvtx.push_range("vLLMAsyncRollout.update_weights()", color="blue")
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
@@ -649,6 +659,7 @@ class vLLMAsyncRollout(BaseRollout):
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
             model.load_weights(weights)
+        nvtx.pop_range()
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

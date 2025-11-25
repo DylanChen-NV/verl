@@ -24,6 +24,7 @@ import numpy as np
 import ray
 import torch
 from cachetools import LRUCache
+import nvtx
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
@@ -328,6 +329,7 @@ class AgentLoopWorkerBase:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        nvtx.push_range("agent_loop_worker.generate_sequences()", color="blue")
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -362,6 +364,7 @@ class AgentLoopWorkerBase:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
+        nvtx.pop_range()
         return output
 
     async def _run_agent_loop(
@@ -391,6 +394,7 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
+            # print("agent_loop", agent_loop) # SingleTurnAgentLoop
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
