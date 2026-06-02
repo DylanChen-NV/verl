@@ -17,6 +17,16 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+ACTIVE_COUNTER_SPANS = {
+    "trajectory",
+    "llm_turn",
+    "llm_client_request",
+    "vllm_engine_request",
+    "tool_turn",
+    "tool_call",
+}
+
+
 def _iter_records(input_path: Path) -> Iterable[dict[str, Any]]:
     paths = [input_path]
     if input_path.is_dir():
@@ -122,13 +132,172 @@ def records_to_perfetto(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return {"traceEvents": events}
 
 
+def _span_bounds(record: dict[str, Any]) -> tuple[int, int] | None:
+    start = record.get("start_unix_ns")
+    end = record.get("end_unix_ns")
+    if start is None:
+        return None
+    if end is None:
+        duration = record.get("duration_ns")
+        if duration is None:
+            return None
+        end = start + duration
+    if end < start:
+        return None
+    return int(start), int(end)
+
+
+def _counter_process_name(scope: str, key: str) -> str:
+    if scope == "global":
+        return "rollout_perf_active@global"
+    return f"rollout_perf_active@{key}"
+
+
+def _add_counter_metadata(events: list[dict[str, Any]], process_ids: dict[str, int], process: str) -> int:
+    if process not in process_ids:
+        process_ids[process] = len(process_ids) + 1
+        pid = process_ids[process]
+        events.append({"name": "process_name", "ph": "M", "pid": pid, "args": {"name": process}})
+        events.append({"name": "thread_name", "ph": "M", "pid": pid, "tid": 1, "args": {"name": "active_counters"}})
+    return process_ids[process]
+
+
+def _process_span_groups(
+    records: Iterable[dict[str, Any]],
+    counter_scope: str,
+) -> dict[tuple[str, str, str], list[tuple[int, int]]]:
+    groups: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    include_global = counter_scope in {"global", "both"}
+    include_process = counter_scope in {"process", "both"}
+
+    for record in records:
+        if record.get("record_type") != "span":
+            continue
+        span_name = record.get("name")
+        if span_name not in ACTIVE_COUNTER_SPANS:
+            continue
+        bounds = _span_bounds(record)
+        if bounds is None:
+            continue
+        if include_global:
+            groups.setdefault(("global", "all", span_name), []).append(bounds)
+        if include_process:
+            groups.setdefault(("process", _process_name(record), span_name), []).append(bounds)
+    return groups
+
+
+def _iter_counter_samples(
+    spans: list[tuple[int, int]],
+    sample_interval_ns: int,
+) -> Iterable[tuple[int, int]]:
+    if not spans:
+        return
+    events = []
+    min_start = min(start for start, _ in spans)
+    max_end = max(end for _, end in spans)
+    for start, end in spans:
+        events.append((start, 1))
+        events.append((end, -1))
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    event_index = 0
+    active = 0
+
+    def process_events_until(timestamp: int) -> int:
+        nonlocal event_index, active
+        while event_index < len(events) and events[event_index][0] <= timestamp:
+            active += events[event_index][1]
+            event_index += 1
+        return active
+
+    last_sample_ts = min_start
+    yield last_sample_ts, process_events_until(last_sample_ts)
+
+    sample_ts = ((min_start // sample_interval_ns) + 1) * sample_interval_ns
+    while sample_ts < max_end:
+        yield sample_ts, process_events_until(sample_ts)
+        last_sample_ts = sample_ts
+        sample_ts += sample_interval_ns
+
+    if max_end != last_sample_ts:
+        yield max_end, process_events_until(max_end)
+
+
+def records_to_active_counter_perfetto(
+    records: Iterable[dict[str, Any]],
+    *,
+    sample_interval_ms: float,
+    counter_scope: str,
+) -> dict[str, Any]:
+    if sample_interval_ms <= 0:
+        raise ValueError("--sample-interval-ms must be positive")
+    sample_interval_ns = int(sample_interval_ms * 1_000_000)
+    if sample_interval_ns <= 0:
+        raise ValueError("--sample-interval-ms is too small")
+
+    groups = _process_span_groups(records, counter_scope)
+    events: list[dict[str, Any]] = []
+    process_ids: dict[str, int] = {}
+
+    for (scope, group_key, span_name), spans in sorted(groups.items()):
+        process = _counter_process_name(scope, group_key)
+        pid = _add_counter_metadata(events, process_ids, process)
+        for sample_ts, active in _iter_counter_samples(spans, sample_interval_ns):
+            args = {
+                "value": active,
+                "span_name": span_name,
+                "scope": scope,
+                "sample_interval_ms": sample_interval_ms,
+            }
+            if scope == "process":
+                args["process"] = group_key
+            events.append(
+                {
+                    "name": f"active/{span_name}",
+                    "cat": "rollout_perf_active",
+                    "ph": "C",
+                    "ts": sample_ts / 1000,
+                    "pid": pid,
+                    "tid": 1,
+                    "args": args,
+                }
+            )
+    return {"traceEvents": events}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export rollout perf JSONL records to Perfetto JSON.")
     parser.add_argument("--input", required=True, help="Input rollout perf JSONL file or directory.")
     parser.add_argument("--output", required=True, help="Output Perfetto JSON path.")
+    parser.add_argument(
+        "--mode",
+        choices=("full", "active_counters"),
+        default="full",
+        help="Export full request timeline or sampled active request counters.",
+    )
+    parser.add_argument(
+        "--sample-interval-ms",
+        type=float,
+        default=100.0,
+        help="Sampling interval for --mode active_counters.",
+    )
+    parser.add_argument(
+        "--counter-scope",
+        choices=("global", "process", "both"),
+        default="both",
+        help="Counter aggregation scope for --mode active_counters.",
+    )
     args = parser.parse_args()
 
-    trace = records_to_perfetto(_iter_records(Path(args.input)))
+    records = _iter_records(Path(args.input))
+    if args.mode == "full":
+        trace = records_to_perfetto(records)
+    else:
+        trace = records_to_active_counter_perfetto(
+            records,
+            sample_interval_ms=args.sample_interval_ms,
+            counter_scope=args.counter_scope,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(trace, ensure_ascii=False), encoding="utf-8")
