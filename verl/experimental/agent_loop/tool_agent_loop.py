@@ -33,6 +33,7 @@ from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.function_tool import FunctionTool, normalize_function_tool_return
 from verl.tools.schemas import ToolResponse
 from verl.utils.profiler import simple_timer
+from verl.utils.rollout_perf import is_current_trace_enabled, push_trace_context, start_span
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
@@ -121,6 +122,14 @@ class ToolAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
 
+    def _safe_text_token_count(self, text: Optional[str]) -> int:
+        if not text or not is_current_trace_enabled():
+            return 0
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=False))
+        except Exception:
+            return 0
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -146,6 +155,13 @@ class ToolAgentLoop(AgentLoopBase):
             request_id=request_id,
             tools_kwargs=tools_kwargs,
         )
+        agent_data.extra_fields.update(
+            {
+                "tool_call_counts": 0,
+                "llm_generated_token_counts": 0,
+                "tool_response_token_counts": 0,
+            }
+        )
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -161,17 +177,18 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data._active_tool_schemas = self.tool_schemas
 
         # State machine loop
-        state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
+        with push_trace_context(logical_request_id=request_id, agent_loop="tool_agent"):
+            state = AgentState.PENDING
+            while state != AgentState.TERMINATED:
+                if state == AgentState.PENDING:
+                    state = await self._handle_pending_state(agent_data, sampling_params)
+                elif state == AgentState.GENERATING:
+                    state = await self._handle_generating_state(agent_data, sampling_params)
+                elif state == AgentState.PROCESSING_TOOLS:
+                    state = await self._handle_processing_tools_state(agent_data)
+                else:
+                    logger.error(f"Invalid state: {state}")
+                    state = AgentState.TERMINATED
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -228,16 +245,38 @@ class ToolAgentLoop(AgentLoopBase):
             stop_token_ids = list(set((sampling_params.get("stop_token_ids") or []) + self.tool_parser.stop_token_ids))
             sampling_params = {**sampling_params, "stop_token_ids": stop_token_ids}
 
-        with simple_timer("generate_sequences", agent_data.metrics):
-            output: TokenOutput = await self.server_manager.generate(
-                request_id=agent_data.request_id,
-                prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
-                image_data=agent_data.image_data,
-                video_data=agent_data.video_data,
-                audio_data=agent_data.audio_data,
-                mm_processor_kwargs=agent_data.mm_processor_kwargs,
+        turn_index = agent_data.assistant_turns
+        with push_trace_context(turn_index=turn_index, turn_kind="assistant"):
+            llm_turn_span = start_span(
+                "llm_turn",
+                {
+                    "input_token_count": len(agent_data.prompt_ids),
+                    "requested_max_tokens": sampling_params.get("max_tokens")
+                    or sampling_params.get("max_new_tokens")
+                    or self.response_length,
+                },
             )
+            try:
+                with simple_timer("generate_sequences", agent_data.metrics):
+                    output: TokenOutput = await self.server_manager.generate(
+                        request_id=agent_data.request_id,
+                        prompt_ids=agent_data.prompt_ids,
+                        sampling_params=sampling_params,
+                        image_data=agent_data.image_data,
+                        video_data=agent_data.video_data,
+                        audio_data=agent_data.audio_data,
+                        mm_processor_kwargs=agent_data.mm_processor_kwargs,
+                    )
+                llm_turn_span.finish(
+                    {
+                        "output_token_count": len(output.token_ids),
+                        "stop_reason": output.stop_reason,
+                        "num_preempted": output.num_preempted,
+                    }
+                )
+            except Exception as e:
+                llm_turn_span.finish(status="error", error=e)
+                raise
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:
             agent_data.metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
@@ -245,8 +284,15 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-        if not agent_data.extra_fields:
+        if agent_data.assistant_turns == 0:
+            # Preserve perf counters while keeping the original first-turn engine extra fields.
+            perf_counters = {
+                "tool_call_counts": agent_data.extra_fields.get("tool_call_counts", 0),
+                "llm_generated_token_counts": agent_data.extra_fields.get("llm_generated_token_counts", 0),
+                "tool_response_token_counts": agent_data.extra_fields.get("tool_response_token_counts", 0),
+            }
             agent_data.extra_fields.update(output.extra_fields)
+            agent_data.extra_fields.update(perf_counters)
         else:
             # Multi-round calls, only update the maximum max_global_steps.
             max_global_steps = output.extra_fields.get("max_global_steps", None)
@@ -260,6 +306,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_ids = output.token_ids
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
+        agent_data.extra_fields["llm_generated_token_counts"] += len(agent_data.response_ids)
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
 
@@ -294,9 +341,17 @@ class ToolAgentLoop(AgentLoopBase):
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
             tool_call_names.append(tool_call.name)
+        agent_data.extra_fields["tool_call_counts"] += len(tasks)
 
-        with simple_timer("tool_calls", agent_data.metrics):
-            responses = await asyncio.gather(*tasks)
+        tool_turn_span = None
+        with push_trace_context(turn_index=agent_data.user_turns, turn_kind="tool"):
+            tool_turn_span = start_span("tool_turn", {"tool_call_count": len(tasks)})
+            try:
+                with simple_timer("tool_calls", agent_data.metrics):
+                    responses = await asyncio.gather(*tasks)
+            except Exception as e:
+                tool_turn_span.finish(status="error", error=e)
+                raise
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
@@ -385,6 +440,13 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            if tool_turn_span is not None:
+                tool_turn_span.finish(
+                    {
+                        "tool_response_token_count": len(response_ids),
+                        "terminated_by_response_length": True,
+                    }
+                )
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
@@ -398,9 +460,17 @@ class ToolAgentLoop(AgentLoopBase):
 
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
+        agent_data.extra_fields["tool_response_token_counts"] += len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
+        if tool_turn_span is not None:
+            tool_turn_span.finish(
+                {
+                    "tool_response_token_count": len(response_ids),
+                    "terminated_by_response_length": False,
+                }
+            )
         return AgentState.GENERATING
 
     async def _call_tool(
@@ -414,68 +484,140 @@ class ToolAgentLoop(AgentLoopBase):
         - ``BaseTool`` subclass: stateful tool with full lifecycle.
         """
         active_tools = getattr(agent_data, "_active_tools", self.tools)
-
-        # Validate tool name
         tool_name = tool_call.name
-        if tool_name not in active_tools:
-            available = list(active_tools.keys())
-            msg = f"Unknown function '{tool_name}'. Available tools: {available}"
-            logger.warning(msg)
-            return ToolResponse(text=msg), 0.0, {}
+        tool_call_id = uuid4().hex
+        arguments_text = tool_call.arguments or ""
+        tool_response_text = ""
+        tool_response_kwargs = None
+        tool_reward = 0.0
+        res = {}
+        status = "ok"
+        error = None
 
-        # Validate tool arguments
-        try:
-            tool_args = json.loads(tool_call.arguments)
-        except (json.JSONDecodeError, TypeError) as e:
-            msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
-            logger.warning(msg)
-            return ToolResponse(text=msg), 0.0, {}
+        with push_trace_context(tool_call_id=tool_call_id, tool_name=tool_name):
+            span = start_span(
+                "tool_call",
+                {
+                    "tool_name": tool_name,
+                    "argument_byte_count": len(arguments_text.encode("utf-8")),
+                    "argument_token_count": self._safe_text_token_count(arguments_text),
+                },
+            )
+            tool, instance_id = None, None
+            try:
+                # Validate tool name
+                if tool_name not in active_tools:
+                    available = list(active_tools.keys())
+                    msg = f"Unknown function '{tool_name}'. Available tools: {available}"
+                    logger.warning(msg)
+                    status = "unknown_tool"
+                    tool_response_text = msg
+                    span.finish(
+                        {
+                            "output_byte_count": len(tool_response_text.encode("utf-8")),
+                            "output_token_count": self._safe_text_token_count(tool_response_text),
+                            "truncated": False,
+                            "has_image": False,
+                            "has_video": False,
+                        },
+                        status=status,
+                    )
+                    return ToolResponse(text=msg), 0.0, {}
 
-        # Execute tool
-        tool, instance_id = None, None
-        try:
-            tool = active_tools[tool_name]
+                # Validate tool arguments
+                try:
+                    tool_args = json.loads(arguments_text)
+                except (json.JSONDecodeError, TypeError) as e:
+                    msg = f"Invalid JSON in arguments for '{tool_name}': {e}"
+                    logger.warning(msg)
+                    status = "invalid_arguments"
+                    error = e
+                    tool_response_text = msg
+                    span.finish(
+                        {
+                            "output_byte_count": len(tool_response_text.encode("utf-8")),
+                            "output_token_count": self._safe_text_token_count(tool_response_text),
+                            "truncated": False,
+                            "has_image": False,
+                            "has_video": False,
+                        },
+                        status=status,
+                        error=error,
+                    )
+                    return ToolResponse(text=msg), 0.0, {}
 
-            if isinstance(tool, FunctionTool):
-                # Function-based tools have no lifecycle; call directly.
-                # Note: tools_kwargs (create_kwargs / release_kwargs) is intentionally
-                # ignored here. Function tools are stateless and per-trajectory state
-                # injection is not supported by design; use a BaseTool subclass instead.
-                raw = await tool.call(tool_args)
-                tool_execution_response, tool_reward, res = normalize_function_tool_return(raw)
-            else:
-                # BaseTool subclass
-                kwargs = tools_kwargs.get(tool_name, {})
-                instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-                tool_execution_response, tool_reward, res = await tool.execute(
-                    instance_id, tool_args, agent_data=agent_data
+                # Execute tool
+                tool = active_tools[tool_name]
+
+                if isinstance(tool, FunctionTool):
+                    # Function-based tools have no lifecycle; call directly.
+                    # Note: tools_kwargs (create_kwargs / release_kwargs) is intentionally
+                    # ignored here. Function tools are stateless and per-trajectory state
+                    # injection is not supported by design; use a BaseTool subclass instead.
+                    raw = await tool.call(tool_args)
+                    tool_execution_response, tool_reward, res = normalize_function_tool_return(raw)
+                else:
+                    # BaseTool subclass
+                    kwargs = tools_kwargs.get(tool_name, {})
+                    instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+                    tool_execution_response, tool_reward, res = await tool.execute(
+                        instance_id, tool_args, agent_data=agent_data
+                    )
+
+                tool_response_text = tool_execution_response.text
+                truncated = False
+                if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
+                    truncated = True
+                    if self.tool_response_truncate_side == "left":
+                        tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
+                    elif self.tool_response_truncate_side == "right":
+                        tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
+                    else:
+                        length = self.max_tool_response_length // 2
+                        tool_response_text = (
+                            tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
+                        )
+
+                # Create ToolResponse from tool execution result
+                tool_response_kwargs = {"text": tool_response_text}
+
+                # Add multimedia data if present
+                for attr_name in ["image", "video"]:
+                    if hasattr(tool_execution_response, attr_name):
+                        attr_value = getattr(tool_execution_response, attr_name)
+                        if attr_value is not None:
+                            tool_response_kwargs[attr_name] = attr_value
+
+                span.finish(
+                    {
+                        "output_byte_count": len((tool_response_text or "").encode("utf-8")),
+                        "output_token_count": self._safe_text_token_count(tool_response_text),
+                        "truncated": truncated,
+                        "has_image": bool(tool_response_kwargs.get("image")),
+                        "has_video": bool(tool_response_kwargs.get("video")),
+                    },
+                    status=status,
+                    error=error,
                 )
-        except Exception as e:
-            logger.warning(f"Error executing tool '{tool_name}': {e}")
-            return ToolResponse(text=f"Error executing tool '{tool_name}': {e}"), 0.0, {}
-        finally:
-            # Only BaseTool instances need release (function tools never set instance_id).
-            if tool and instance_id and not isinstance(tool, FunctionTool):
-                await tool.release(instance_id)
-
-        tool_response_text = tool_execution_response.text
-        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
-            if self.tool_response_truncate_side == "left":
-                tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
-            elif self.tool_response_truncate_side == "right":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
-            else:
-                length = self.max_tool_response_length // 2
-                tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
-
-        # Create ToolResponse from tool execution result
-        tool_response_kwargs = {"text": tool_response_text}
-
-        # Add multimedia data if present
-        for attr_name in ["image", "video"]:
-            if hasattr(tool_execution_response, attr_name):
-                attr_value = getattr(tool_execution_response, attr_name)
-                if attr_value is not None:
-                    tool_response_kwargs[attr_name] = attr_value
-
-        return ToolResponse(**tool_response_kwargs), tool_reward, res
+                return ToolResponse(**tool_response_kwargs), tool_reward, res
+            except Exception as e:
+                status = "error"
+                error = e
+                logger.warning(f"Error executing tool '{tool_name}': {e}")
+                tool_response_text = f"Error executing tool '{tool_name}': {e}"
+                span.finish(
+                    {
+                        "output_byte_count": len(tool_response_text.encode("utf-8")),
+                        "output_token_count": self._safe_text_token_count(tool_response_text),
+                        "truncated": False,
+                        "has_image": False,
+                        "has_video": False,
+                    },
+                    status=status,
+                    error=error,
+                )
+                return ToolResponse(text=tool_response_text), 0.0, {}
+            finally:
+                # Only BaseTool instances need release (function tools never set instance_id).
+                if tool and instance_id and not isinstance(tool, FunctionTool):
+                    await tool.release(instance_id)

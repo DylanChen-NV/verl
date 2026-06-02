@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import time
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -38,6 +39,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
+from verl.utils.rollout_perf import init_rollout_perf, push_trace_context, start_span
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -79,6 +81,35 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _extract_vllm_request_metrics(metrics: Any) -> dict[str, Any]:
+    """Extract stable scalar fields from vLLM request metrics when exposed."""
+    if metrics is None:
+        return {}
+    result = {}
+    field_names = (
+        "arrival_time",
+        "first_scheduled_time",
+        "first_token_time",
+        "last_token_time",
+        "finished_time",
+        "time_in_queue",
+        "scheduler_time",
+        "model_forward_time",
+        "model_execute_time",
+    )
+    for field_name in field_names:
+        if hasattr(metrics, field_name):
+            value = getattr(metrics, field_name)
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                result[field_name] = value
+    spec_stats = getattr(metrics, "request_spec_decode_stats", None)
+    if spec_stats is not None:
+        for field_name in ("num_draft_tokens", "num_accepted_tokens", "num_verify_steps"):
+            if hasattr(spec_stats, field_name):
+                result[f"spec_decode/{field_name}"] = getattr(spec_stats, field_name)
+    return result
 
 
 class vLLMHttpServer:
@@ -123,6 +154,12 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        init_rollout_perf(self.config.perf_trace, role="vllm_server")
+        if self.config.perf_trace.engine_internal.enable and self.config.disable_log_stats:
+            logger.warning(
+                "rollout perf trace engine_internal is enabled, but rollout.disable_log_stats=True; "
+                "vLLM request metrics may be unavailable. Set rollout.disable_log_stats=False for richer metrics."
+            )
         self._validate_configs()
 
         self.rollout_mode = rollout_mode
@@ -462,145 +499,206 @@ class vLLMHttpServer:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        rollout_perf_trace: Optional[dict[str, Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
-        prompt_ids = normalize_token_ids(prompt_ids)
-
-        # Calculate the maximum possible new tokens based on available context space
-        # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
-        # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
-        # least one token of headroom to be able to generate at all.
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 1:
-            raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
-                f"model's maximum context length ({self.config.max_model_len}); need at least "
-                f"1 token of headroom."
-            )
-
-        # Determine max_tokens from sampling_params or use configured response_length as default
-        if "max_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_tokens")
-        elif "max_new_tokens" in sampling_params:
-            # support sglang-style 'max_new_tokens' param
-            max_tokens = sampling_params.pop("max_new_tokens")
-        else:
-            # Default to a calculation that considers configured lengths
-            # Cap max_tokens by response_length to ensure tensor alignment,
-            # and by remaining budget to prevent OOM in multi-turn rollouts.
-            max_tokens = min(
-                self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
-            )
-
-        # Clamp max_tokens to the valid range [1, max_possible_tokens]. The lower bound
-        # is 1 because vLLM v0.20+ raises VLLMValidationError when max_tokens < 1.
-        max_tokens = max(1, min(max_tokens, max_possible_tokens))
-
-        assert 1 <= max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
+        perf_context_values = dict(rollout_perf_trace or {"trace_sampled": False})
+        perf_context_values.update(
+            {
+                "engine_backend": "vllm",
+                "engine_request_id": request_id,
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+            }
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
-        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-        if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
-
-        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
-        if mm_processor_kwargs:
-            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        perf_context = push_trace_context(**perf_context_values)
+        perf_context.__enter__()
+        span_payload = {}
+        span_status = "ok"
+        span_error = None
+        engine_span = start_span(
+            "vllm_engine_request",
+            {
+                "engine_request_id": request_id,
+                "prompt_token_count": len(prompt_ids),
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "rollout_mode": str(self.rollout_mode),
+            },
+        )
         try:
-            prompt = TokensPrompt(**prompt_kwargs)
-        except TypeError:
-            prompt = prompt_kwargs
+            prompt_ids = normalize_token_ids(prompt_ids)
 
-        # Add lora request
-        lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+            # Calculate the maximum possible new tokens based on available context space
+            # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
+            # (see vllm.sampling_params.SamplingParams._verify_args), so we require at
+            # least one token of headroom to be able to generate at all.
+            max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+            if max_possible_tokens < 1:
+                raise ValueError(
+                    f"Prompt length ({len(prompt_ids)}) leaves no room to generate within the "
+                    f"model's maximum context length ({self.config.max_model_len}); need at least "
+                    f"1 token of headroom."
                 )
 
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
+            # Determine max_tokens from sampling_params or use configured response_length as default
+            if "max_tokens" in sampling_params:
+                max_tokens = sampling_params.pop("max_tokens")
+            elif "max_new_tokens" in sampling_params:
+                # support sglang-style 'max_new_tokens' param
+                max_tokens = sampling_params.pop("max_new_tokens")
+            else:
+                # Default to a calculation that considers configured lengths
+                # Cap max_tokens by response_length to ensure tensor alignment,
+                # and by remaining budget to prevent OOM in multi-turn rollouts.
+                max_tokens = min(
+                    self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids)
+                )
 
-        # Get final response
-        final_res: Optional[RequestOutput] = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None
+            # Clamp max_tokens to the valid range [1, max_possible_tokens]. The lower bound
+            # is 1 because vLLM v0.20+ raises VLLMValidationError when max_tokens < 1.
+            max_tokens = max(1, min(max_tokens, max_possible_tokens))
 
-        # Handle abort case: when the request is aborted by pause_generation(abort),
-        # outputs may be empty. Return empty results with stop_reason="aborted"
-        # instead of crashing with "IndexError: list index out of range".
-        if not final_res.outputs:
-            return TokenOutput(
-                token_ids=[],
-                log_probs=None,
-                routed_experts=None,
-                stop_reason="aborted",
+            assert 1 <= max_tokens <= max_possible_tokens, (
+                f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
+            )
+            sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+            sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+            sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+            prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+            multi_modal_data = {}
+            if image_data is not None:
+                multi_modal_data["image"] = image_data
+            if video_data is not None:
+                multi_modal_data["video"] = video_data
+            if audio_data is not None:
+                multi_modal_data["audio"] = audio_data
+
+            prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+            if mm_processor_kwargs:
+                prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+            try:
+                prompt = TokensPrompt(**prompt_kwargs)
+            except TypeError:
+                prompt = prompt_kwargs
+
+            # Add lora request
+            lora_request = None
+            if self.lora_as_adapter:
+                # Make sure we also check that the lora is already loaded in the engine
+                lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+                if lora_loaded:
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                    )
+
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
             )
 
-        extra_fields = {"global_steps": self.global_steps}
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling_params.prompt_logprobs,
-            result_dict=extra_fields,
-        )
-        token_ids = final_res.outputs[0].token_ids
-        log_probs = None
-        if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # Get final response
+            final_res: Optional[RequestOutput] = None
+            first_output_unix_ns = None
+            first_output_monotonic_ns = None
+            async for output in generator:
+                if first_output_monotonic_ns is None:
+                    first_output_unix_ns = time.time_ns()
+                    first_output_monotonic_ns = time.monotonic_ns()
+                final_res = output
+            assert final_res is not None
 
-        routed_experts = None
-        if self.config.enable_rollout_routing_replay:
-            routed_experts = final_res.outputs[0].routed_experts
+            # Handle abort case: when the request is aborted by pause_generation(abort),
+            # outputs may be empty. Return empty results with stop_reason="aborted"
+            # instead of crashing with "IndexError: list index out of range".
+            if not final_res.outputs:
+                span_payload.update(
+                    {
+                        "output_token_count": 0,
+                        "stop_reason": "aborted",
+                        "finish_reason": "abort",
+                        "ttft_ns": None,
+                        "first_output_unix_ns": first_output_unix_ns,
+                        "vllm_request_metrics": _extract_vllm_request_metrics(getattr(final_res, "metrics", None)),
+                    }
+                )
+                return TokenOutput(
+                    token_ids=[],
+                    log_probs=None,
+                    routed_experts=None,
+                    stop_reason="aborted",
+                )
 
-        # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
-        if finish_reason == "abort":
-            stop_reason = "aborted"
-        elif finish_reason in ("stop", "length"):
-            stop_reason = "completed"
-        else:
-            stop_reason = finish_reason  # for more stop reason in the future
+            extra_fields = {"global_steps": self.global_steps}
+            extract_prompt_logprobs(
+                output=final_res,
+                num_prompt_logprobs=sampling_params.prompt_logprobs,
+                result_dict=extra_fields,
+            )
+            token_ids = final_res.outputs[0].token_ids
+            log_probs = None
+            if sampling_params.logprobs is not None:
+                log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
-        num_preempted = None
+            routed_experts = None
+            if self.config.enable_rollout_routing_replay:
+                routed_experts = final_res.outputs[0].routed_experts
 
-        if hasattr(final_res.outputs[0], "num_preempted"):
-            num_preempted = final_res.outputs[0].num_preempted
+            # Determine stop reason from finish_reason
+            finish_reason = final_res.outputs[0].finish_reason
+            if finish_reason == "abort":
+                stop_reason = "aborted"
+            elif finish_reason in ("stop", "length"):
+                stop_reason = "completed"
+            else:
+                stop_reason = finish_reason  # for more stop reason in the future
 
-        # Re-key backend spec-decoding stats to the rollout-common names.
-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            if final_res.metrics is None or final_res.metrics.request_spec_decode_stats is None:
-                raise RuntimeError("vLLM MTP rollout requires request_spec_decode_stats; set disable_log_stats=False.")
-            spec_decode_stats = final_res.metrics.request_spec_decode_stats
-            extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
-            extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
-            extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
-        return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
-            routed_experts=routed_experts,
-            stop_reason=stop_reason,
-            num_preempted=num_preempted,
-            extra_fields=extra_fields,
-        )
+            num_preempted = None
 
+            if hasattr(final_res.outputs[0], "num_preempted"):
+                num_preempted = final_res.outputs[0].num_preempted
+
+            # Re-key backend spec-decoding stats to the rollout-common names.
+            if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+                if final_res.metrics is None or final_res.metrics.request_spec_decode_stats is None:
+                    raise RuntimeError("vLLM MTP rollout requires request_spec_decode_stats; set disable_log_stats=False.")
+                spec_decode_stats = final_res.metrics.request_spec_decode_stats
+                extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
+                extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
+                extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
+            span_payload.update(
+                {
+                    "output_token_count": len(token_ids),
+                    "stop_reason": stop_reason,
+                    "finish_reason": finish_reason,
+                    "num_preempted": num_preempted,
+                    "ttft_ns": first_output_monotonic_ns - engine_span.start_monotonic_ns
+                    if first_output_monotonic_ns is not None
+                    else None,
+                    "first_output_unix_ns": first_output_unix_ns,
+                    "vllm_request_metrics": _extract_vllm_request_metrics(getattr(final_res, "metrics", None)),
+                }
+            )
+            return TokenOutput(
+                token_ids=token_ids,
+                log_probs=log_probs,
+                routed_experts=routed_experts,
+                stop_reason=stop_reason,
+                num_preempted=num_preempted,
+                extra_fields=extra_fields,
+            )
+
+        except Exception as e:
+            span_status = "error"
+            span_error = e
+            raise
+        finally:
+            engine_span.finish(span_payload, status=span_status, error=span_error)
+            perf_context.__exit__(None, None, None)
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return

@@ -315,6 +315,51 @@ trace:
   # Total traces per step = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample
   max_samples_per_step_per_worker: null
 
+# rollout performance trace data
+# This is separate from rollout.trace. It writes local raw trace files that can
+# be exported offline to Perfetto or analyzed/replayed later.
+perf_trace:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.utils.rollout_perf.config.PerfTraceConfig
+
+  # Enable rollout perf trace collection. Disabled by default.
+  enable: False
+
+  # Output directory for raw JSONL trace files. If null, defaults to ./rollout_perf_trace.
+  output_dir: null
+
+  # Raw trace format. Currently only jsonl is supported.
+  format: jsonl
+
+  # Whether to save prompt/tool raw content. Keep this false unless debugging requires it.
+  capture_content: False
+
+  # Maximum number of unique samples to trace per agent worker per training step.
+  # If null, all samples are traced when perf_trace.enable is true.
+  max_samples_per_step_per_worker: null
+
+  # Flush interval for process-local trace writers.
+  flush_interval_s: 5.0
+
+  # Whether to export Perfetto automatically. The first version exports offline via CLI.
+  export_perfetto: False
+
+  # Engine-internal collection settings.
+  engine_internal:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.utils.rollout_perf.config.PerfTraceEngineInternalConfig
+
+    # Enable inference-engine internal metrics collection.
+    enable: False
+
+    # auto, vllm, sglang, trtllm.
+    backend: auto
+
+    # Sampling interval for future periodic engine counters.
+    sample_interval_ms: 100
+
 # rollout skip config (load/dump rollout data)
 skip:
 

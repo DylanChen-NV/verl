@@ -265,6 +265,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    for batch_key in ("llm_generated_token_counts", "tool_response_token_counts"):
+        if batch_key in batch.non_tensor_batch:
+            values = [value for value in batch.non_tensor_batch[batch_key] if value is not None]
+            if values:
+                values = np.asarray(values, dtype=np.float64)
+                metrics[f"{batch_key}/min"] = values.min()
+                metrics[f"{batch_key}/max"] = values.max()
+                metrics[f"{batch_key}/mean"] = values.mean()
+
     return metrics
 
 

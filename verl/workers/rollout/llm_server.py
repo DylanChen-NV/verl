@@ -30,6 +30,7 @@ from omegaconf import DictConfig
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils.ray_utils import auto_await
+from verl.utils.rollout_perf import get_trace_context_for_rpc, is_current_trace_enabled, start_span
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
@@ -89,6 +90,11 @@ class GlobalRequestLoadBalancer:
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
+
+    def acquire_server_with_status(self, request_id: str) -> tuple[str, ray.actor.ActorHandle, dict]:
+        """Acquire a server and return a load-balancer status snapshot for tracing."""
+        server_id, handle = self.acquire_server(request_id)
+        return server_id, handle, self.get_status()
 
     def release_server(self, server_id: str) -> None:
         """Release a server after a request completes."""
@@ -171,6 +177,9 @@ class LLMServerClient:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
         return await self._load_balancer.acquire_server.remote(request_id=request_id)
 
+    async def _acquire_server_with_status(self, request_id: str) -> tuple[str, ray.actor.ActorHandle, dict]:
+        return await self._load_balancer.acquire_server_with_status.remote(request_id=request_id)
+
     def _release_server(self, server_id: str) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
@@ -199,25 +208,70 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        engine_request_id = uuid4().hex  # use new request_id for each turn
+        span = start_span(
+            "llm_client_request",
+            {
+                "logical_request_id": request_id,
+                "engine_request_id": engine_request_id,
+                "prompt_token_count": len(prompt_ids),
+                "requested_max_tokens": sampling_params.get("max_tokens")
+                or sampling_params.get("max_new_tokens")
+                or self.config.actor_rollout_ref.rollout.get("response_length", None),
+            },
+        )
+        load_balancer_status = None
         try:
+            if is_current_trace_enabled():
+                server_id, server, load_balancer_status = await self._acquire_server_with_status(request_id)
+            else:
+                server_id, server = await self._acquire_server(request_id)
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data
             if mm_processor_kwargs:
                 multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+
+            rpc_context = get_trace_context_for_rpc()
+            trace_kwargs = {}
+            rollout_name = self.config.actor_rollout_ref.rollout.get("name", None)
+            if rpc_context is not None and rollout_name == "vllm":
+                rpc_context = dict(rpc_context)
+                rpc_context.update(
+                    {
+                        "logical_request_id": request_id,
+                        "engine_request_id": engine_request_id,
+                        "server_id": server_id,
+                        "load_balancer_status": load_balancer_status,
+                    }
+                )
+                trace_kwargs["rollout_perf_trace"] = rpc_context
+
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=engine_request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
                 **multimodal_kwargs,
+                **trace_kwargs,
                 **kwargs,
             )
+            span.finish(
+                {
+                    "server_id": server_id,
+                    "output_token_count": len(getattr(output, "token_ids", []) or []),
+                    "stop_reason": getattr(output, "stop_reason", None),
+                    "load_balancer_status": load_balancer_status,
+                }
+            )
             return output
+        except Exception as e:
+            span.finish(status="error", error=e)
+            raise
         finally:
-            self._release_server(server_id)
+            if "server_id" in locals():
+                self._release_server(server_id)
 
 
 class LLMServerManager:

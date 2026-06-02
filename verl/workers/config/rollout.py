@@ -19,6 +19,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.utils.rollout_perf.config import PerfTraceConfig, PerfTraceEngineInternalConfig
 from verl.workers.config.disaggregation import DisaggregationConfig
 from verl.workers.config.model import MtpConfig
 
@@ -28,6 +29,8 @@ __all__ = [
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
     "TraceConfig",
+    "PerfTraceConfig",
+    "PerfTraceEngineInternalConfig",
     "ServerConfig",
     "PrometheusConfig",
     "RolloutConfig",
@@ -227,6 +230,8 @@ class RolloutConfig(BaseConfig):
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
+
+    perf_trace: PerfTraceConfig = field(default_factory=PerfTraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 

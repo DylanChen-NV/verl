@@ -55,6 +55,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.rollout_perf import init_rollout_perf, is_rollout_perf_enabled, push_trace_context, start_span
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
@@ -415,6 +416,7 @@ class AgentLoopWorker:
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        init_rollout_perf(self.rollout_config.perf_trace, role="agent_loop_worker")
 
         self.dataset_cls = get_dataset_class(config.data)
         self.tokenizer = self.model_config.tokenizer
@@ -538,6 +540,21 @@ class AgentLoopWorker:
         else:
             traced_indices = set(range(len(batch)))
 
+        perf_traced_indices = set()
+        if is_rollout_perf_enabled():
+            max_perf_samples_per_worker = self.rollout_config.perf_trace.max_samples_per_step_per_worker
+            if max_perf_samples_per_worker is not None:
+                unique_sample_indices = np.unique(index)
+                if max_perf_samples_per_worker < len(unique_sample_indices):
+                    selected_samples = set(
+                        np.random.choice(unique_sample_indices, max_perf_samples_per_worker, replace=False).tolist()
+                    )
+                    perf_traced_indices = set(i for i in range(len(batch)) if index[i] in selected_samples)
+                else:
+                    perf_traced_indices = set(range(len(batch)))
+            else:
+                perf_traced_indices = set(range(len(batch)))
+
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
@@ -554,7 +571,13 @@ class AgentLoopWorker:
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_agent_loop(
+                        sample_sampling_params,
+                        trajectory_info[i],
+                        trace=trace_this_sample,
+                        perf_trace=i in perf_traced_indices,
+                        **kwargs,
+                    )
                 )
             )
         outputs = await asyncio.gather(*tasks)
@@ -571,6 +594,7 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         trace: bool = True,
+        perf_trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
@@ -581,23 +605,58 @@ class AgentLoopWorker:
             name="agent_loop",
             trace=trace,
         ):
-            assert agent_name in _agent_loop_registry, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            trajectory_id = (
+                f"{trajectory['step']}:{trajectory['sample_index']}:{trajectory['rollout_n']}:{uuid4().hex[:8]}"
             )
+            with push_trace_context(
+                trace_sampled=perf_trace,
+                trajectory_id=trajectory_id,
+                global_step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                agent_name=agent_name,
+            ):
+                span = start_span(
+                    "trajectory",
+                    {
+                        "agent_name": agent_name,
+                        "sample_index": trajectory["sample_index"],
+                        "rollout_n": trajectory["rollout_n"],
+                    },
+                )
+                try:
+                    assert agent_name in _agent_loop_registry, (
+                        f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+                    )
 
-            agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=DictConfigWrap(config=self.config),
-                server_manager=self.llm_client,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-                tools=ToolListWrap(self.tools),
-            )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+                    agent_loop_config = _agent_loop_registry[agent_name]
+                    agent_loop = hydra.utils.instantiate(
+                        config=agent_loop_config,
+                        trainer_config=DictConfigWrap(config=self.config),
+                        server_manager=self.llm_client,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        dataset_cls=self.dataset_cls,
+                        data_config=DictConfigWrap(self.config.data),
+                        tools=ToolListWrap(self.tools),
+                    )
+                    output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+                    llm_generated_tokens = int(sum(output.response_mask))
+                    span.finish(
+                        {
+                            "prompt_token_count": len(output.prompt_ids),
+                            "response_token_count": len(output.response_ids),
+                            "llm_generated_token_count": llm_generated_tokens,
+                            "tool_response_token_count": int(len(output.response_mask) - llm_generated_tokens),
+                            "num_turns": output.num_turns,
+                            "tool_call_count": output.extra_fields.get("tool_call_counts"),
+                        }
+                    )
+                    return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+                except Exception as e:
+                    span.finish(status="error", error=e)
+                    raise
 
     def _pad_token_ids(
         self,
