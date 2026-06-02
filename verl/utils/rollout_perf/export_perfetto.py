@@ -247,7 +247,6 @@ def records_to_active_counter_perfetto(
                 "value": active,
                 "span_name": span_name,
                 "scope": scope,
-                "sample_interval_ms": sample_interval_ms,
             }
             if scope == "process":
                 args["process"] = group_key
