@@ -170,6 +170,7 @@ class RolloutPerfVLLMSampledMetrics:
         "vllm/scheduler/requests_running",
         "vllm/scheduler/requests_waiting",
         "vllm/kv_cache/usage_ratio",
+        "vllm/kv_len_per_request_alloc_est_avg",
     )
     ITERATION_COUNTERS = (
         "vllm/iteration/prefill_requests",
@@ -181,8 +182,17 @@ class RolloutPerfVLLMSampledMetrics:
     )
     INTERVAL_COUNTERS = STATE_COUNTERS + ITERATION_COUNTERS
 
-    def __init__(self, context: dict[str, Any], sample_interval_ms: int):
+    def __init__(
+        self,
+        context: dict[str, Any],
+        sample_interval_ms: int,
+        *,
+        num_gpu_blocks: Optional[int] = None,
+        block_size: Optional[int] = None,
+    ):
         self.context = dict(context)
+        self.num_gpu_blocks = num_gpu_blocks if num_gpu_blocks and num_gpu_blocks > 0 else None
+        self.block_size = block_size if block_size and block_size > 0 else None
         self.sample_interval_ms = _positive_int(sample_interval_ms, 500)
         self.sample_interval_ns = self.sample_interval_ms * 1_000_000
         self._lock = threading.Lock()
@@ -216,6 +226,15 @@ class RolloutPerfVLLMSampledMetrics:
                 self._observe_locked("vllm/scheduler/requests_waiting", waiting_requests)
             if kv_cache_usage_ratio is not None:
                 self._observe_locked("vllm/kv_cache/usage_ratio", kv_cache_usage_ratio)
+            if (
+                kv_cache_usage_ratio is not None
+                and running_requests is not None
+                and running_requests > 0
+                and self.num_gpu_blocks is not None
+                and self.block_size is not None
+            ):
+                allocated_tokens = float(kv_cache_usage_ratio) * self.num_gpu_blocks * self.block_size
+                self._observe_locked("vllm/kv_len_per_request_alloc_est_avg", allocated_tokens / running_requests)
 
     def record_iteration(
         self,
@@ -292,6 +311,11 @@ class RolloutPerfVLLMSampledMetrics:
         sample_payload.update(payload)
         sample_payload["sample_interval_ms"] = self.sample_interval_ms
         sample_payload["value_semantics"] = "window_avg"
+        if self.num_gpu_blocks is not None:
+            sample_payload["num_gpu_blocks"] = self.num_gpu_blocks
+        if self.block_size is not None:
+            sample_payload["block_size"] = self.block_size
+        sample_payload["kv_len_per_request_alloc_avg_source"] = "kv_cache_usage_x_total_blocks_x_block_size_div_running_requests"
         return sample_payload
 
     def _observe_locked(self, name: str, value: Any) -> None:
@@ -353,7 +377,6 @@ class RolloutPerfRequestKVMetricsSampler:
                 "sample_interval_ms": self.sample_interval_ms,
                 "block_size": self.block_size,
                 "kv_length_source": "server_request_progress",
-                "allocated_length_semantics": "block_rounded_estimate",
             }
         )
         emit_unsampled_event("vllm_request_kv_sampler_started", payload, context=payload)
@@ -406,20 +429,16 @@ class RolloutPerfRequestKVMetricsSampler:
             if not should_emit:
                 return
             self._last_emit_had_active = bool(logical_lengths)
-        allocated_lengths = [float(int(math.ceil(value / block_size) * block_size)) for value in logical_lengths]
         payload = dict(self.context)
         payload.update(
             {
                 "sample_interval_ms": self.sample_interval_ms,
                 "block_size": block_size,
                 "kv_length_source": "server_request_progress",
-                "allocated_length_semantics": "block_rounded_estimate",
             }
         )
         emit_unsampled_counter(self.LOGICAL_AVG, _mean(logical_lengths), payload, context=payload)
         emit_unsampled_counter(self.LOGICAL_P95, _nearest_rank_percentile(logical_lengths, 95.0), payload, context=payload)
-        emit_unsampled_counter(self.ALLOC_EST_AVG, _mean(allocated_lengths), payload, context=payload)
-        emit_unsampled_counter(self.ALLOC_EST_P95, _nearest_rank_percentile(allocated_lengths, 95.0), payload, context=payload)
 
 
 class RolloutPerfVLLMStatLogger(StatLoggerBase):
@@ -463,7 +482,12 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
             "node_rank": os.getenv("VERL_NODE_RANK"),
             "vllm_version": getattr(vllm, "__version__", None) if vllm is not None else None,
         }
-        self._sampled_metrics = RolloutPerfVLLMSampledMetrics(self.context, self.sample_interval_ms)
+        self._sampled_metrics = RolloutPerfVLLMSampledMetrics(
+            self.context,
+            self.sample_interval_ms,
+            num_gpu_blocks=self.num_gpu_blocks,
+            block_size=self.block_size,
+        )
 
     def log_engine_initialized(self):
         emit_unsampled_event(
@@ -584,7 +608,8 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
                 "missing_or_deferred": missing_or_deferred,
                 "notes": (
                     "Scheduler and iteration metrics come from vLLM StatLogger and are sampled in-process. "
-                    "KV length avg/p95 metrics are sampled from server-side request progress."
+                    "Logical KV length avg/p95 metrics are sampled from server-side request progress. "
+                    "Allocated per-request avg is derived from engine global KV cache usage divided by running requests."
                 ),
             },
             context=payload,
