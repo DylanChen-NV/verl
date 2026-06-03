@@ -27,16 +27,20 @@ AGENT_COUNTER_SPANS = {
 
 VLLM_SERVER_COUNTER_SPANS = {"vllm_engine_request"}
 
-VLLM_COUNTER_NAME_MAP = {
-    "vllm/scheduler/running_requests": "vllm/running_requests",
-    "vllm/scheduler/waiting_requests": "vllm/waiting_requests",
+VLLM_STATE_COUNTERS = {
+    "vllm/scheduler/running_requests": ("vllm/running_requests", 1.0),
+    "vllm/scheduler/waiting_requests": ("vllm/waiting_requests", 1.0),
+    "vllm/kv_cache/usage_ratio": ("vllm/kv_cache_usage_%", 100.0),
+}
+
+VLLM_BUCKET_SUM_COUNTERS = {
     "vllm/iteration/batch_requests_total": "vllm/batch_requests",
     "vllm/iteration/prefill_tokens_computed": "vllm/prefill_tokens",
     "vllm/iteration/decode_tokens": "vllm/decode_tokens",
     "vllm/iteration/batch_tokens_total": "vllm/batch_tokens",
-    "vllm/kv_cache/usage_ratio": "vllm/kv_cache_usage",
-    "vllm/kv_cache/blocks_used": "vllm/kv_blocks_used",
 }
+
+VLLM_FOCUSED_COUNTERS = set(VLLM_STATE_COUNTERS) | set(VLLM_BUCKET_SUM_COUNTERS)
 
 
 def _iter_records(input_path: Path) -> Iterable[dict[str, Any]]:
@@ -190,7 +194,7 @@ def _collect_active_counter_ids(
             agent_keys.append(_source_key(record))
         if record_type == "span" and name in VLLM_SERVER_COUNTER_SPANS:
             server_keys.append(_source_key(record))
-        if record_type == "counter" and name in VLLM_COUNTER_NAME_MAP:
+        if record_type == "counter" and name in VLLM_FOCUSED_COUNTERS:
             server_keys.append(_source_key(record))
     return _stable_id_map(agent_keys, "a"), _stable_id_map(server_keys, "s")
 
@@ -268,9 +272,146 @@ def _active_counter_args(active: int) -> dict[str, Any]:
     return {"value": active}
 
 
-def _selected_counter_args(record: dict[str, Any]) -> dict[str, Any]:
-    payload = record.get("payload") or {}
-    return {"value": payload.get("value")}
+def _counter_args(value: float) -> dict[str, Any]:
+    return {"value": value}
+
+
+def _trace_time_bounds(records: Iterable[dict[str, Any]]) -> tuple[int, int] | None:
+    min_ts = None
+    max_ts = None
+    for record in records:
+        bounds = _span_bounds(record) if record.get("record_type") == "span" else None
+        if bounds is not None:
+            candidates = bounds
+        else:
+            timestamp = record.get("time_unix_ns")
+            if timestamp is None:
+                continue
+            candidates = (int(timestamp), int(timestamp))
+        for timestamp in candidates:
+            min_ts = timestamp if min_ts is None else min(min_ts, timestamp)
+            max_ts = timestamp if max_ts is None else max(max_ts, timestamp)
+    if min_ts is None or max_ts is None:
+        return None
+    return min_ts, max_ts
+
+
+def _iter_sample_timestamps(start_ns: int, end_ns: int, sample_interval_ns: int) -> Iterable[int]:
+    sample_ts = start_ns
+    while sample_ts < end_ns:
+        yield sample_ts
+        sample_ts += sample_interval_ns
+    yield end_ns
+
+
+def _engine_id(record: dict[str, Any], server_ids: dict[tuple[str, int], str]) -> str | None:
+    source_key = _source_key(record)
+    if source_key not in server_ids:
+        return None
+    return f"{server_ids[source_key]}e{_engine_index(record)}"
+
+
+def _numeric_payload_value(record: dict[str, Any]) -> float | None:
+    value = (record.get("payload") or {}).get("value")
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _add_vllm_state_counter_events(
+    events: list[dict[str, Any]],
+    process_ids: dict[str, int],
+    records: Iterable[dict[str, Any]],
+    server_ids: dict[tuple[str, int], str],
+    trace_bounds: tuple[int, int] | None,
+    sample_interval_ns: int,
+) -> None:
+    if trace_bounds is None:
+        return
+    series: dict[tuple[str, str], list[tuple[int, float]]] = {}
+    for record in records:
+        if record.get("record_type") != "counter":
+            continue
+        mapping = VLLM_STATE_COUNTERS.get(record.get("name"))
+        if mapping is None:
+            continue
+        engine_id = _engine_id(record, server_ids)
+        value = _numeric_payload_value(record)
+        if engine_id is None or value is None:
+            continue
+        output_name, scale = mapping
+        series.setdefault((engine_id, output_name), []).append((int(record.get("time_unix_ns", 0)), value * scale))
+
+    start_ns, end_ns = trace_bounds
+    sample_timestamps = list(_iter_sample_timestamps(start_ns, end_ns, sample_interval_ns))
+    for (engine_id, output_name), samples in sorted(series.items()):
+        samples.sort()
+        sample_index = 0
+        current_value = 0.0
+        pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
+        for sample_ts in sample_timestamps:
+            while sample_index < len(samples) and samples[sample_index][0] <= sample_ts:
+                current_value = samples[sample_index][1]
+                sample_index += 1
+            events.append(
+                {
+                    "name": output_name,
+                    "cat": "rollout_perf_counter",
+                    "ph": "C",
+                    "ts": sample_ts / 1000,
+                    "pid": pid,
+                    "tid": 1,
+                    "args": _counter_args(current_value),
+                }
+            )
+
+
+def _add_vllm_bucket_sum_counter_events(
+    events: list[dict[str, Any]],
+    process_ids: dict[str, int],
+    records: Iterable[dict[str, Any]],
+    server_ids: dict[tuple[str, int], str],
+    trace_bounds: tuple[int, int] | None,
+    sample_interval_ns: int,
+) -> None:
+    if trace_bounds is None:
+        return
+    start_ns, end_ns = trace_bounds
+    bucket_count = ((end_ns - start_ns) // sample_interval_ns) + 1
+    series: dict[tuple[str, str], list[float]] = {}
+    for record in records:
+        if record.get("record_type") != "counter":
+            continue
+        output_name = VLLM_BUCKET_SUM_COUNTERS.get(record.get("name"))
+        if output_name is None:
+            continue
+        engine_id = _engine_id(record, server_ids)
+        value = _numeric_payload_value(record)
+        if engine_id is None or value is None:
+            continue
+        bucket_index = max(0, min((int(record.get("time_unix_ns", 0)) - start_ns) // sample_interval_ns, bucket_count - 1))
+        buckets = series.setdefault((engine_id, output_name), [0.0] * bucket_count)
+        buckets[bucket_index] += value
+
+    for (engine_id, output_name), buckets in sorted(series.items()):
+        pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
+        for bucket_index, value in enumerate(buckets):
+            sample_ts = start_ns + bucket_index * sample_interval_ns
+            if sample_ts > end_ns:
+                sample_ts = end_ns
+            events.append(
+                {
+                    "name": output_name,
+                    "cat": "rollout_perf_counter",
+                    "ph": "C",
+                    "ts": sample_ts / 1000,
+                    "pid": pid,
+                    "tid": 1,
+                    "args": _counter_args(value),
+                }
+            )
 
 
 def _add_selected_vllm_counter_events(
@@ -278,31 +419,11 @@ def _add_selected_vllm_counter_events(
     process_ids: dict[str, int],
     records: Iterable[dict[str, Any]],
     server_ids: dict[tuple[str, int], str],
+    trace_bounds: tuple[int, int] | None,
+    sample_interval_ns: int,
 ) -> None:
-    for record in records:
-        if record.get("record_type") != "counter":
-            continue
-        output_name = VLLM_COUNTER_NAME_MAP.get(record.get("name"))
-        if output_name is None:
-            continue
-        source_key = _source_key(record)
-        if source_key not in server_ids:
-            continue
-        server_id = server_ids[source_key]
-        engine_idx = _engine_index(record)
-        engine_id = f"{server_id}e{engine_idx}"
-        pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
-        events.append(
-            {
-                "name": output_name,
-                "cat": "rollout_perf_counter",
-                "ph": "C",
-                "ts": record.get("time_unix_ns", 0) / 1000,
-                "pid": pid,
-                "tid": 1,
-                "args": _selected_counter_args(record),
-            }
-        )
+    _add_vllm_state_counter_events(events, process_ids, records, server_ids, trace_bounds, sample_interval_ns)
+    _add_vllm_bucket_sum_counter_events(events, process_ids, records, server_ids, trace_bounds, sample_interval_ns)
 
 
 def records_to_active_counter_perfetto(
@@ -322,6 +443,7 @@ def records_to_active_counter_perfetto(
     record_list = list(records)
     agent_ids, server_ids = _collect_active_counter_ids(record_list)
     groups = _process_span_groups(record_list, agent_ids, server_ids)
+    trace_bounds = _trace_time_bounds(record_list)
     events: list[dict[str, Any]] = []
     process_ids: dict[str, int] = {}
 
@@ -339,7 +461,7 @@ def records_to_active_counter_perfetto(
                     "args": _active_counter_args(active),
                 }
             )
-    _add_selected_vllm_counter_events(events, process_ids, record_list, server_ids)
+    _add_selected_vllm_counter_events(events, process_ids, record_list, server_ids, trace_bounds, sample_interval_ns)
     return {"traceEvents": events}
 
 
