@@ -137,7 +137,7 @@ Implemented P0 pieces:
 
 ```text
 Collection spans: trajectory, llm_turn, tool_turn, tool_call, llm_client_request, vllm_engine_request.
-Collection counters: vLLM scheduler state, iteration bucket totals, KV cache usage, logical/allocated KV length avg and p95.
+Collection counters: vLLM scheduler/iteration/KV cache window avg counters with max/count metadata, plus logical/allocated-estimate KV length avg and p95.
 Exporters: full Perfetto JSON trace and focused active_counters Perfetto JSON trace.
 Configuration: actor_rollout_ref.rollout.perf_trace.engine_internal.sample_interval_ms, default 500 ms.
 ```
@@ -146,10 +146,10 @@ vLLM internal counter semantics:
 
 ```text
 Scheduler/iteration/KV counters are emitted only while the local vLLM server process has active rollout requests.
-When the final active rollout request finishes, pending buckets are flushed and final zero state counters are emitted.
+When the final active rollout request finishes, pending windows are flushed and final zero counters are emitted.
 running_requests/waiting_requests are named requests_running/requests_waiting in both new raw records and focused Perfetto output.
-The focused active_counters exporter samples vLLM counters over each server's active vllm_engine_request windows.
-Raw JSONL remains the source of truth and keeps host/pid/rank/sample interval metadata.
+The focused active_counters exporter samples vLLM counters over each server's active vllm_engine_request windows and defaults to the raw window average value.
+Raw JSONL remains the source of truth and keeps host/pid/rank/sample interval metadata plus max_value/num_samples for coalesced vLLM counters.
 ```
 
 Latest validation:
@@ -185,7 +185,7 @@ from span intervals. Engine global counters are derived from sampled per-engine
 counters. Request/token counters are summed, while cache usage and
 `kv_len_per_request_*` counters emit mean and max.
 
-KV length counters were renamed to make the estimate explicit:
+KV length counters were renamed to make the per-request estimate explicit:
 
 ```text
 vllm/kv_len_per_request_logical_avg
@@ -193,6 +193,14 @@ vllm/kv_len_per_request_logical_p95
 vllm/kv_len_per_request_alloc_est_avg
 vllm/kv_len_per_request_alloc_est_p95
 ```
+
+`logical` length is prompt tokens plus cumulative decoded tokens. `alloc_est` is
+a block-rounded estimate computed as `ceil(logical_len / block_size) * block_size`;
+it is not read from vLLM's real per-request used KV blocks. Both logical and
+alloc-est counters are produced by a server-side request-progress sampler. The
+sampler uses the same configured interval as the vLLM StatLogger coalescer, but
+it has an independent sampling phase; focused Perfetto output uses low-cost
+timestamp alignment instead of a shared online ticker.
 
 The exporter maps older raw names such as `vllm/kv_len_logical_avg` to the new
 Perfetto names for backward compatibility. New raw traces use the new names.
@@ -493,11 +501,12 @@ Sampling semantics:
 ```text
 Default engine_internal.sample_interval_ms is 500.
 Small validation runs can override to 100 through Hydra.
-Scheduler state counters use latest value per window, except kv_cache_usage_ratio uses max per window.
-Iteration counters are bucket sums per window.
+Scheduler, iteration, and kv_cache_usage_ratio counters store window average as payload.value and keep max_value plus num_samples in raw JSONL.
+Perfetto focused counter mode displays payload.value by default, so request/token counters represent instantaneous average workload over the sample window, not cumulative bucket totals.
 Request KV length counters are sampled by a background server-side sampler over active requests.
 logical_kv_len = prompt tokens + cumulative decoded tokens.
-allocated_est_kv_len = ceil(logical_kv_len / block_size) * block_size.
+allocated_est_kv_len = ceil(logical_kv_len / block_size) * block_size, a block-rounded estimate rather than true vLLM used-block accounting.
+The KV length sampler uses the same interval setting but an independent phase; exporter-side timestamp alignment is the current low-cost synchronization scheme.
 Perfetto focused counter args contain only value; metadata remains in raw JSONL.
 ```
 

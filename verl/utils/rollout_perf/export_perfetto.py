@@ -13,7 +13,6 @@
 # limitations under the License.
 import argparse
 import json
-from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -29,7 +28,7 @@ AGENT_COUNTER_SPANS = {
 
 VLLM_SERVER_COUNTER_SPANS = {"vllm_engine_request"}
 
-VLLM_STATE_COUNTERS = {
+VLLM_SAMPLED_COUNTERS = {
     "vllm/scheduler/requests_running": ("vllm/requests_running", 1.0),
     "vllm/scheduler/requests_waiting": ("vllm/requests_waiting", 1.0),
     # Backward compatibility for traces collected before the requests_* rename.
@@ -45,6 +44,12 @@ VLLM_STATE_COUNTERS = {
     "vllm/kv_len_logical_p95": ("vllm/kv_len_per_request_logical_p95", 1.0),
     "vllm/kv_len_alloc_est_avg": ("vllm/kv_len_per_request_alloc_est_avg", 1.0),
     "vllm/kv_len_alloc_est_p95": ("vllm/kv_len_per_request_alloc_est_p95", 1.0),
+    "vllm/iteration/batch_requests_total": ("vllm/requests_batch", 1.0),
+    "vllm/iteration/prefill_requests": ("vllm/requests_prefill", 1.0),
+    "vllm/iteration/decode_requests": ("vllm/requests_decode", 1.0),
+    "vllm/iteration/batch_tokens_total": ("vllm/tokens_batch", 1.0),
+    "vllm/iteration/prefill_tokens_computed": ("vllm/tokens_prefill", 1.0),
+    "vllm/iteration/decode_tokens": ("vllm/tokens_decode", 1.0),
 }
 
 GLOBAL_VLLM_ENGINE_SUM_COUNTERS = {
@@ -78,16 +83,7 @@ GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS = {
     ),
 }
 
-VLLM_BUCKET_SUM_COUNTERS = {
-    "vllm/iteration/batch_requests_total": "vllm/requests_batch",
-    "vllm/iteration/prefill_requests": "vllm/requests_prefill",
-    "vllm/iteration/decode_requests": "vllm/requests_decode",
-    "vllm/iteration/batch_tokens_total": "vllm/tokens_batch",
-    "vllm/iteration/prefill_tokens_computed": "vllm/tokens_prefill",
-    "vllm/iteration/decode_tokens": "vllm/tokens_decode",
-}
-
-VLLM_FOCUSED_COUNTERS = set(VLLM_STATE_COUNTERS) | set(VLLM_BUCKET_SUM_COUNTERS)
+VLLM_FOCUSED_COUNTERS = set(VLLM_SAMPLED_COUNTERS)
 
 
 def _iter_records(input_path: Path) -> Iterable[dict[str, Any]]:
@@ -480,7 +476,7 @@ def _numeric_payload_value(record: dict[str, Any]) -> float | None:
     return None
 
 
-def _collect_vllm_state_series(
+def _collect_vllm_sampled_counter_series(
     records: Iterable[dict[str, Any]],
     server_ids: dict[tuple[str, int], str],
     server_active_spans: dict[str, list[tuple[int, int]]],
@@ -489,7 +485,7 @@ def _collect_vllm_state_series(
     for record in records:
         if record.get("record_type") != "counter":
             continue
-        mapping = VLLM_STATE_COUNTERS.get(record.get("name"))
+        mapping = VLLM_SAMPLED_COUNTERS.get(record.get("name"))
         if mapping is None:
             continue
         engine_id = _engine_id(record, server_ids)
@@ -507,32 +503,6 @@ def _collect_vllm_state_series(
     return series
 
 
-def _collect_vllm_bucket_series(
-    records: Iterable[dict[str, Any]],
-    server_ids: dict[tuple[str, int], str],
-    server_active_spans: dict[str, list[tuple[int, int]]],
-) -> dict[str, list[tuple[int, float]]]:
-    raw_series: dict[str, list[tuple[int, float]]] = defaultdict(list)
-    for record in records:
-        if record.get("record_type") != "counter":
-            continue
-        output_name = VLLM_BUCKET_SUM_COUNTERS.get(record.get("name"))
-        if output_name is None:
-            continue
-        engine_id = _engine_id(record, server_ids)
-        value = _numeric_payload_value(record)
-        if engine_id is None or value is None:
-            continue
-        timestamp = int(record.get("time_unix_ns", 0))
-        server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id))
-        if server_spans and not _timestamp_in_spans(timestamp, server_spans):
-            continue
-        raw_series[output_name].append((timestamp, value))
-    for samples in raw_series.values():
-        samples.sort()
-    return dict(raw_series)
-
-
 def _global_vllm_sample_timestamps(
     server_active_spans: dict[str, list[tuple[int, int]]],
     sample_interval_ns: int,
@@ -543,7 +513,7 @@ def _global_vllm_sample_timestamps(
     return list(_iter_sample_timestamps_for_spans(spans, sample_interval_ns))
 
 
-def _add_vllm_state_counter_events(
+def _add_vllm_sampled_counter_events(
     events: list[dict[str, Any]],
     process_ids: dict[str, int],
     records: Iterable[dict[str, Any]],
@@ -552,7 +522,7 @@ def _add_vllm_state_counter_events(
     trace_bounds: tuple[int, int] | None,
     sample_interval_ns: int,
 ) -> None:
-    series = _collect_vllm_state_series(records, server_ids, server_active_spans)
+    series = _collect_vllm_sampled_counter_series(records, server_ids, server_active_spans)
     for (engine_id, output_name), samples in sorted(series.items()):
         sample_timestamps = _counter_sample_timestamps_for_engine(
             engine_id, server_active_spans, trace_bounds, sample_interval_ns
@@ -579,59 +549,7 @@ def _add_vllm_state_counter_events(
             )
 
 
-def _add_vllm_bucket_sum_counter_events(
-    events: list[dict[str, Any]],
-    process_ids: dict[str, int],
-    records: Iterable[dict[str, Any]],
-    server_ids: dict[tuple[str, int], str],
-    server_active_spans: dict[str, list[tuple[int, int]]],
-    trace_bounds: tuple[int, int] | None,
-    sample_interval_ns: int,
-) -> None:
-    raw_series: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
-    for record in records:
-        if record.get("record_type") != "counter":
-            continue
-        output_name = VLLM_BUCKET_SUM_COUNTERS.get(record.get("name"))
-        if output_name is None:
-            continue
-        engine_id = _engine_id(record, server_ids)
-        value = _numeric_payload_value(record)
-        if engine_id is None or value is None:
-            continue
-        timestamp = int(record.get("time_unix_ns", 0))
-        server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id))
-        if server_spans and not _timestamp_in_spans(timestamp, server_spans):
-            continue
-        raw_series[(engine_id, output_name)].append((timestamp, value))
-
-    for (engine_id, output_name), samples in sorted(raw_series.items()):
-        sample_timestamps = _counter_sample_timestamps_for_engine(
-            engine_id, server_active_spans, trace_bounds, sample_interval_ns
-        )
-        if not sample_timestamps:
-            continue
-        buckets = [0.0] * len(sample_timestamps)
-        for timestamp, value in sorted(samples):
-            bucket_index = bisect_right(sample_timestamps, timestamp) - 1
-            bucket_index = max(0, min(bucket_index, len(buckets) - 1))
-            buckets[bucket_index] += value
-        pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
-        for sample_ts, value in zip(sample_timestamps, buckets):
-            events.append(
-                {
-                    "name": output_name,
-                    "cat": "rollout_perf_counter",
-                    "ph": "C",
-                    "ts": sample_ts / 1000,
-                    "pid": pid,
-                    "tid": 1,
-                    "args": _counter_args(value),
-                }
-            )
-
-
-def _add_global_vllm_engine_state_counter_events(
+def _add_global_vllm_engine_sampled_counter_events(
     events: list[dict[str, Any]],
     process_ids: dict[str, int],
     records: Iterable[dict[str, Any]],
@@ -642,7 +560,7 @@ def _add_global_vllm_engine_state_counter_events(
     sample_timestamps = _global_vllm_sample_timestamps(server_active_spans, sample_interval_ns)
     if not sample_timestamps:
         return
-    series = _collect_vllm_state_series(records, server_ids, server_active_spans)
+    series = _collect_vllm_sampled_counter_series(records, server_ids, server_active_spans)
     if not series:
         return
     sample_indices = {key: 0 for key in series}
@@ -691,41 +609,6 @@ def _add_global_vllm_engine_state_counter_events(
                     )
 
 
-def _add_global_vllm_engine_bucket_counter_events(
-    events: list[dict[str, Any]],
-    process_ids: dict[str, int],
-    records: Iterable[dict[str, Any]],
-    server_ids: dict[tuple[str, int], str],
-    server_active_spans: dict[str, list[tuple[int, int]]],
-    sample_interval_ns: int,
-) -> None:
-    sample_timestamps = _global_vllm_sample_timestamps(server_active_spans, sample_interval_ns)
-    if not sample_timestamps:
-        return
-    raw_series = _collect_vllm_bucket_series(records, server_ids, server_active_spans)
-    if not raw_series:
-        return
-    pid = _add_counter_metadata(events, process_ids, "global/vllm_engine")
-    for output_name, samples in sorted(raw_series.items()):
-        buckets = [0.0] * len(sample_timestamps)
-        for timestamp, value in samples:
-            bucket_index = bisect_right(sample_timestamps, timestamp) - 1
-            bucket_index = max(0, min(bucket_index, len(buckets) - 1))
-            buckets[bucket_index] += value
-        for sample_ts, value in zip(sample_timestamps, buckets):
-            events.append(
-                {
-                    "name": output_name,
-                    "cat": "rollout_perf_counter_global",
-                    "ph": "C",
-                    "ts": sample_ts / 1000,
-                    "pid": pid,
-                    "tid": 1,
-                    "args": _counter_args(value),
-                }
-            )
-
-
 def _add_global_vllm_engine_counter_events(
     events: list[dict[str, Any]],
     process_ids: dict[str, int],
@@ -734,10 +617,7 @@ def _add_global_vllm_engine_counter_events(
     server_active_spans: dict[str, list[tuple[int, int]]],
     sample_interval_ns: int,
 ) -> None:
-    _add_global_vllm_engine_state_counter_events(
-        events, process_ids, records, server_ids, server_active_spans, sample_interval_ns
-    )
-    _add_global_vllm_engine_bucket_counter_events(
+    _add_global_vllm_engine_sampled_counter_events(
         events, process_ids, records, server_ids, server_active_spans, sample_interval_ns
     )
 
@@ -754,10 +634,7 @@ def _add_selected_vllm_counter_events(
     _add_global_vllm_engine_counter_events(
         events, process_ids, records, server_ids, server_active_spans, sample_interval_ns
     )
-    _add_vllm_state_counter_events(
-        events, process_ids, records, server_ids, server_active_spans, trace_bounds, sample_interval_ns
-    )
-    _add_vllm_bucket_sum_counter_events(
+    _add_vllm_sampled_counter_events(
         events, process_ids, records, server_ids, server_active_spans, trace_bounds, sample_interval_ns
     )
 

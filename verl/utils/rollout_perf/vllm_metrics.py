@@ -171,7 +171,7 @@ class RolloutPerfVLLMSampledMetrics:
         "vllm/scheduler/requests_waiting",
         "vllm/kv_cache/usage_ratio",
     )
-    BUCKET_SUM_COUNTERS = (
+    ITERATION_COUNTERS = (
         "vllm/iteration/prefill_requests",
         "vllm/iteration/decode_requests",
         "vllm/iteration/batch_requests_total",
@@ -179,15 +179,17 @@ class RolloutPerfVLLMSampledMetrics:
         "vllm/iteration/decode_tokens",
         "vllm/iteration/batch_tokens_total",
     )
+    INTERVAL_COUNTERS = STATE_COUNTERS + ITERATION_COUNTERS
 
     def __init__(self, context: dict[str, Any], sample_interval_ms: int):
         self.context = dict(context)
         self.sample_interval_ms = _positive_int(sample_interval_ms, 500)
         self.sample_interval_ns = self.sample_interval_ms * 1_000_000
         self._lock = threading.Lock()
-        self._latest_state: dict[str, float] = {}
-        self._bucket_sums: dict[str, float] = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
-        self._has_bucket_data = False
+        self._window_sums: dict[str, float] = {}
+        self._window_maxes: dict[str, float] = {}
+        self._window_counts: dict[str, int] = {}
+        self._has_window_data = False
         self._next_emit_monotonic_ns: int | None = None
         self._seen_rollout_activity = False
         self._emitted_idle_zero = True
@@ -209,15 +211,11 @@ class RolloutPerfVLLMSampledMetrics:
             self._emitted_idle_zero = False
             self._set_next_emit_if_needed()
             if running_requests is not None:
-                self._latest_state["vllm/scheduler/requests_running"] = float(running_requests)
+                self._observe_locked("vllm/scheduler/requests_running", running_requests)
             if waiting_requests is not None:
-                self._latest_state["vllm/scheduler/requests_waiting"] = float(waiting_requests)
+                self._observe_locked("vllm/scheduler/requests_waiting", waiting_requests)
             if kv_cache_usage_ratio is not None:
-                # Keep the peak usage observed in the sampling window. A max is more useful
-                # than the last value for spotting short cache pressure spikes.
-                key = "vllm/kv_cache/usage_ratio"
-                self._latest_state[key] = max(float(kv_cache_usage_ratio), self._latest_state.get(key, 0.0))
-            self._emit_due_locked(payload)
+                self._observe_locked("vllm/kv_cache/usage_ratio", kv_cache_usage_ratio)
 
     def record_iteration(
         self,
@@ -246,8 +244,10 @@ class RolloutPerfVLLMSampledMetrics:
                 "vllm/iteration/batch_tokens_total": batch_tokens_total,
             }
             for name, value in updates.items():
-                self._bucket_sums[name] += float(value or 0)
-            self._has_bucket_data = True
+                self._observe_locked(name, value or 0)
+
+    def emit_due(self, payload: dict[str, Any]) -> None:
+        with self._lock:
             self._emit_due_locked(payload)
 
     def flush(self, payload: dict[str, Any]) -> None:
@@ -261,12 +261,14 @@ class RolloutPerfVLLMSampledMetrics:
 
     def emit_rollout_finished(self) -> None:
         with self._lock:
-            if self._has_bucket_data:
-                self._emit_bucket_sums_locked(self._base_payload({}))
+            if self._has_window_data:
+                self._emit_locked({})
             if self._seen_rollout_activity and not self._emitted_idle_zero:
                 payload = self._base_payload({})
-                for name in self.STATE_COUNTERS:
-                    emit_unsampled_counter(name, 0.0, payload, context=payload)
+                zero_payload = dict(payload)
+                zero_payload.update({"max_value": 0.0, "num_samples": 1, "is_idle_zero": True})
+                for name in self.INTERVAL_COUNTERS:
+                    emit_unsampled_counter(name, 0.0, zero_payload, context=payload)
                 self._emitted_idle_zero = True
             self._reset_locked()
             self._seen_rollout_activity = False
@@ -289,33 +291,44 @@ class RolloutPerfVLLMSampledMetrics:
         sample_payload = dict(self.context)
         sample_payload.update(payload)
         sample_payload["sample_interval_ms"] = self.sample_interval_ms
+        sample_payload["value_semantics"] = "window_avg"
         return sample_payload
+
+    def _observe_locked(self, name: str, value: Any) -> None:
+        number = _as_number(value)
+        if number is None:
+            return
+        self._window_sums[name] = self._window_sums.get(name, 0.0) + number
+        self._window_maxes[name] = max(number, self._window_maxes.get(name, number))
+        self._window_counts[name] = self._window_counts.get(name, 0) + 1
+        self._has_window_data = True
 
     def _emit_locked(self, payload: dict[str, Any]) -> None:
         sample_payload = self._base_payload(payload)
-        for name in self.STATE_COUNTERS:
-            if name in self._latest_state:
-                emit_unsampled_counter(name, self._latest_state[name], sample_payload, context=sample_payload)
-        if self._has_bucket_data:
-            self._emit_bucket_sums_locked(sample_payload)
-        # kv_cache usage is max-over-window, so reset it after each emitted window.
-        self._latest_state.pop("vllm/kv_cache/usage_ratio", None)
+        for name in self.INTERVAL_COUNTERS:
+            count = self._window_counts.get(name, 0)
+            if count <= 0:
+                continue
+            value = self._window_sums[name] / count
+            counter_payload = dict(sample_payload)
+            counter_payload["max_value"] = self._window_maxes[name]
+            counter_payload["num_samples"] = count
+            emit_unsampled_counter(name, value, counter_payload, context=sample_payload)
+        self._reset_window_locked()
 
-    def _emit_bucket_sums_locked(self, payload: dict[str, Any]) -> None:
-        for name in self.BUCKET_SUM_COUNTERS:
-            emit_unsampled_counter(name, self._bucket_sums.get(name, 0.0), payload, context=payload)
-        self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
-        self._has_bucket_data = False
+    def _reset_window_locked(self) -> None:
+        self._window_sums.clear()
+        self._window_maxes.clear()
+        self._window_counts.clear()
+        self._has_window_data = False
 
     def _reset_locked(self) -> None:
-        self._latest_state.clear()
-        self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
-        self._has_bucket_data = False
+        self._reset_window_locked()
         self._next_emit_monotonic_ns = None
 
 
 class RolloutPerfRequestKVMetricsSampler:
-    """Sample active request KV lengths from server-side request progress."""
+    """Sample active request logical KV length and block-rounded estimates."""
 
     LOGICAL_AVG = "vllm/kv_len_per_request_logical_avg"
     LOGICAL_P95 = "vllm/kv_len_per_request_logical_p95"
@@ -335,7 +348,14 @@ class RolloutPerfRequestKVMetricsSampler:
         self._thread = threading.Thread(target=self._run, name="rollout-perf-vllm-kv-sampler", daemon=True)
         self._thread.start()
         payload = dict(self.context)
-        payload.update({"sample_interval_ms": self.sample_interval_ms, "block_size": self.block_size})
+        payload.update(
+            {
+                "sample_interval_ms": self.sample_interval_ms,
+                "block_size": self.block_size,
+                "kv_length_source": "server_request_progress",
+                "allocated_length_semantics": "block_rounded_estimate",
+            }
+        )
         emit_unsampled_event("vllm_request_kv_sampler_started", payload, context=payload)
 
     def set_block_size(self, block_size: Any) -> None:
@@ -388,7 +408,14 @@ class RolloutPerfRequestKVMetricsSampler:
             self._last_emit_had_active = bool(logical_lengths)
         allocated_lengths = [float(int(math.ceil(value / block_size) * block_size)) for value in logical_lengths]
         payload = dict(self.context)
-        payload.update({"sample_interval_ms": self.sample_interval_ms, "block_size": block_size})
+        payload.update(
+            {
+                "sample_interval_ms": self.sample_interval_ms,
+                "block_size": block_size,
+                "kv_length_source": "server_request_progress",
+                "allocated_length_semantics": "block_rounded_estimate",
+            }
+        )
         emit_unsampled_counter(self.LOGICAL_AVG, _mean(logical_lengths), payload, context=payload)
         emit_unsampled_counter(self.LOGICAL_P95, _nearest_rank_percentile(logical_lengths, 95.0), payload, context=payload)
         emit_unsampled_counter(self.ALLOC_EST_AVG, _mean(allocated_lengths), payload, context=payload)
@@ -468,6 +495,7 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
             self._record_iteration_stats(iteration_stats, payload)
         if mm_cache_stats is not None:
             self._record_mm_cache_stats(mm_cache_stats, payload)
+        self._sampled_metrics.emit_due(payload)
         if not self._capability_reported:
             self._emit_capability_event(scheduler_stats, iteration_stats, mm_cache_stats, payload)
             self._capability_reported = True
