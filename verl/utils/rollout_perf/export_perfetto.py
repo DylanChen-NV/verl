@@ -17,13 +17,25 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-ACTIVE_COUNTER_SPANS = {
+AGENT_COUNTER_SPANS = {
     "trajectory",
     "llm_turn",
     "llm_client_request",
-    "vllm_engine_request",
     "tool_turn",
     "tool_call",
+}
+
+VLLM_SERVER_COUNTER_SPANS = {"vllm_engine_request"}
+
+VLLM_COUNTER_NAME_MAP = {
+    "vllm/scheduler/running_requests": "vllm/running_requests",
+    "vllm/scheduler/waiting_requests": "vllm/waiting_requests",
+    "vllm/iteration/batch_requests_total": "vllm/batch_requests",
+    "vllm/iteration/prefill_tokens_computed": "vllm/prefill_tokens",
+    "vllm/iteration/decode_tokens": "vllm/decode_tokens",
+    "vllm/iteration/batch_tokens_total": "vllm/batch_tokens",
+    "vllm/kv_cache/usage_ratio": "vllm/kv_cache_usage",
+    "vllm/kv_cache/blocks_used": "vllm/kv_blocks_used",
 }
 
 
@@ -147,10 +159,40 @@ def _span_bounds(record: dict[str, Any]) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
-def _counter_process_name(scope: str, key: str) -> str:
-    if scope == "global":
-        return "rollout_perf_active@global"
-    return f"rollout_perf_active@{key}"
+def _source_key(record: dict[str, Any]) -> tuple[str, int]:
+    return str(record.get("hostname", "host")), int(record.get("pid", 0) or 0)
+
+
+def _stable_id_map(keys: Iterable[tuple[str, int]], prefix: str) -> dict[tuple[str, int], str]:
+    return {key: f"{prefix}{index}" for index, key in enumerate(sorted(set(keys)))}
+
+
+def _engine_index(record: dict[str, Any]) -> str:
+    payload = record.get("payload") or {}
+    context = record.get("context") or {}
+    for key in ("engine_idx", "engine_index"):
+        value = payload.get(key, context.get(key))
+        if value is not None:
+            return str(value)
+    return "0"
+
+
+def _collect_active_counter_ids(
+    records: Iterable[dict[str, Any]],
+) -> tuple[dict[tuple[str, int], str], dict[tuple[str, int], str]]:
+    agent_keys = []
+    server_keys = []
+    for record in records:
+        record_type = record.get("record_type")
+        name = record.get("name")
+        role = record.get("role")
+        if record_type == "span" and role == "agent_loop_worker" and name in AGENT_COUNTER_SPANS:
+            agent_keys.append(_source_key(record))
+        if record_type == "span" and name in VLLM_SERVER_COUNTER_SPANS:
+            server_keys.append(_source_key(record))
+        if record_type == "counter" and name in VLLM_COUNTER_NAME_MAP:
+            server_keys.append(_source_key(record))
+    return _stable_id_map(agent_keys, "a"), _stable_id_map(server_keys, "s")
 
 
 def _add_counter_metadata(events: list[dict[str, Any]], process_ids: dict[str, int], process: str) -> int:
@@ -158,79 +200,30 @@ def _add_counter_metadata(events: list[dict[str, Any]], process_ids: dict[str, i
         process_ids[process] = len(process_ids) + 1
         pid = process_ids[process]
         events.append({"name": "process_name", "ph": "M", "pid": pid, "args": {"name": process}})
-        events.append({"name": "thread_name", "ph": "M", "pid": pid, "tid": 1, "args": {"name": "active_counters"}})
+        events.append({"name": "thread_name", "ph": "M", "pid": pid, "tid": 1, "args": {"name": "counters"}})
     return process_ids[process]
-
-
-def _raw_counter_args(record: dict[str, Any]) -> dict[str, Any]:
-    payload = record.get("payload") or {}
-    context = record.get("context") or {}
-    args = {"value": payload.get("value")}
-    for key in (
-        "engine_backend",
-        "engine_index",
-        "engine_idx",
-        "replica_rank",
-        "node_rank",
-        "vllm_version",
-        "priority",
-    ):
-        value = payload.get(key, context.get(key))
-        if value is not None:
-            args[key] = str(value)
-    priority = record.get("priority")
-    if priority is not None:
-        args["priority"] = str(priority)
-    args["counter_source"] = "raw"
-    return args
-
-
-def _add_raw_counter_events(
-    events: list[dict[str, Any]],
-    process_ids: dict[str, int],
-    records: Iterable[dict[str, Any]],
-) -> None:
-    for record in records:
-        if record.get("record_type") != "counter":
-            continue
-        name = record.get("name", "counter")
-        if not name.startswith("vllm/"):
-            continue
-        pid = _add_counter_metadata(events, process_ids, _process_name(record))
-        events.append(
-            {
-                "name": name,
-                "cat": "rollout_perf_counter",
-                "ph": "C",
-                "ts": record.get("time_unix_ns", 0) / 1000,
-                "pid": pid,
-                "tid": 1,
-                "args": _raw_counter_args(record),
-            }
-        )
 
 
 def _process_span_groups(
     records: Iterable[dict[str, Any]],
-    counter_scope: str,
+    agent_ids: dict[tuple[str, int], str],
+    server_ids: dict[tuple[str, int], str],
 ) -> dict[tuple[str, str, str], list[tuple[int, int]]]:
     groups: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
-    include_global = counter_scope in {"global", "both"}
-    include_process = counter_scope in {"process", "both"}
-
     for record in records:
         if record.get("record_type") != "span":
             continue
         span_name = record.get("name")
-        if span_name not in ACTIVE_COUNTER_SPANS:
-            continue
         bounds = _span_bounds(record)
         if bounds is None:
             continue
-        if include_global:
-            groups.setdefault(("global", "all", span_name), []).append(bounds)
-        if include_process:
-            groups.setdefault(("process", _process_name(record), span_name), []).append(bounds)
+        key = _source_key(record)
+        if record.get("role") == "agent_loop_worker" and span_name in AGENT_COUNTER_SPANS and key in agent_ids:
+            group_id = agent_ids[key]
+            groups.setdefault((f"agent_loop_worker/{group_id}", span_name, group_id), []).append(bounds)
+        elif span_name in VLLM_SERVER_COUNTER_SPANS and key in server_ids:
+            group_id = server_ids[key]
+            groups.setdefault((f"vllm_server/{group_id}", span_name, group_id), []).append(bounds)
     return groups
 
 
@@ -271,12 +264,72 @@ def _iter_counter_samples(
         yield max_end, process_events_until(max_end)
 
 
+def _active_counter_args(record_group_id: str, span_name: str, active: int) -> dict[str, Any]:
+    return {
+        "value": active,
+        "span_name": span_name,
+        "group_id": record_group_id,
+    }
+
+
+def _selected_counter_args(record: dict[str, Any], server_id: str, engine_id: str) -> dict[str, Any]:
+    payload = record.get("payload") or {}
+    context = record.get("context") or {}
+    args: dict[str, Any] = {
+        "value": payload.get("value"),
+        "source_counter": record.get("name"),
+        "server": server_id,
+        "engine": engine_id,
+        "hostname": record.get("hostname"),
+        "pid": record.get("pid"),
+    }
+    for key in ("engine_backend", "engine_index", "engine_idx", "replica_rank", "node_rank", "vllm_version"):
+        value = payload.get(key, context.get(key))
+        if value is not None:
+            args[key] = str(value)
+    return args
+
+
+def _add_selected_vllm_counter_events(
+    events: list[dict[str, Any]],
+    process_ids: dict[str, int],
+    records: Iterable[dict[str, Any]],
+    server_ids: dict[tuple[str, int], str],
+) -> None:
+    for record in records:
+        if record.get("record_type") != "counter":
+            continue
+        output_name = VLLM_COUNTER_NAME_MAP.get(record.get("name"))
+        if output_name is None:
+            continue
+        source_key = _source_key(record)
+        if source_key not in server_ids:
+            continue
+        server_id = server_ids[source_key]
+        engine_idx = _engine_index(record)
+        engine_id = f"{server_id}e{engine_idx}"
+        pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
+        events.append(
+            {
+                "name": output_name,
+                "cat": "rollout_perf_counter",
+                "ph": "C",
+                "ts": record.get("time_unix_ns", 0) / 1000,
+                "pid": pid,
+                "tid": 1,
+                "args": _selected_counter_args(record, server_id, engine_id),
+            }
+        )
+
+
 def records_to_active_counter_perfetto(
     records: Iterable[dict[str, Any]],
     *,
     sample_interval_ms: float,
     counter_scope: str,
 ) -> dict[str, Any]:
+    del counter_scope  # Kept for CLI compatibility; active_counters now uses structured groups.
+
     if sample_interval_ms <= 0:
         raise ValueError("--sample-interval-ms must be positive")
     sample_interval_ns = int(sample_interval_ms * 1_000_000)
@@ -284,21 +337,14 @@ def records_to_active_counter_perfetto(
         raise ValueError("--sample-interval-ms is too small")
 
     record_list = list(records)
-    groups = _process_span_groups(record_list, counter_scope)
+    agent_ids, server_ids = _collect_active_counter_ids(record_list)
+    groups = _process_span_groups(record_list, agent_ids, server_ids)
     events: list[dict[str, Any]] = []
     process_ids: dict[str, int] = {}
 
-    for (scope, group_key, span_name), spans in sorted(groups.items()):
-        process = _counter_process_name(scope, group_key)
+    for (process, span_name, group_id), spans in sorted(groups.items()):
         pid = _add_counter_metadata(events, process_ids, process)
         for sample_ts, active in _iter_counter_samples(spans, sample_interval_ns):
-            args = {
-                "value": active,
-                "span_name": span_name,
-                "scope": scope,
-            }
-            if scope == "process":
-                args["process"] = group_key
             events.append(
                 {
                     "name": f"active/{span_name}",
@@ -307,10 +353,10 @@ def records_to_active_counter_perfetto(
                     "ts": sample_ts / 1000,
                     "pid": pid,
                     "tid": 1,
-                    "args": args,
+                    "args": _active_counter_args(group_id, span_name, active),
                 }
             )
-    _add_raw_counter_events(events, process_ids, record_list)
+    _add_selected_vllm_counter_events(events, process_ids, record_list, server_ids)
     return {"traceEvents": events}
 
 
@@ -334,7 +380,7 @@ def main() -> None:
         "--counter-scope",
         choices=("global", "process", "both"),
         default="both",
-        help="Counter aggregation scope for --mode active_counters.",
+        help="Deprecated compatibility flag; active_counters uses agent/server/engine groups.",
     )
     args = parser.parse_args()
 
