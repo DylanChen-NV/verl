@@ -320,7 +320,7 @@ def _add_global_span_counter_events(
                     "ts": sample_ts / 1000,
                     "pid": pid,
                     "tid": 1,
-                    "args": _active_counter_args(active),
+                    "args": _global_active_counter_args(active),
                 }
             )
 
@@ -363,6 +363,10 @@ def _iter_counter_window_max_samples(
 
 def _active_counter_args(active: int) -> dict[str, Any]:
     return {"window_max": active}
+
+
+def _global_active_counter_args(active: int) -> dict[str, Any]:
+    return {"window_max_sum": active}
 
 
 def _counter_args(arg_name: str, value: float) -> dict[str, Any]:
