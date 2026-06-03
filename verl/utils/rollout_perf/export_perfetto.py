@@ -264,30 +264,13 @@ def _iter_counter_samples(
         yield max_end, process_events_until(max_end)
 
 
-def _active_counter_args(record_group_id: str, span_name: str, active: int) -> dict[str, Any]:
-    return {
-        "value": active,
-        "span_name": span_name,
-        "group_id": record_group_id,
-    }
+def _active_counter_args(active: int) -> dict[str, Any]:
+    return {"value": active}
 
 
-def _selected_counter_args(record: dict[str, Any], server_id: str, engine_id: str) -> dict[str, Any]:
+def _selected_counter_args(record: dict[str, Any]) -> dict[str, Any]:
     payload = record.get("payload") or {}
-    context = record.get("context") or {}
-    args: dict[str, Any] = {
-        "value": payload.get("value"),
-        "source_counter": record.get("name"),
-        "server": server_id,
-        "engine": engine_id,
-        "hostname": record.get("hostname"),
-        "pid": record.get("pid"),
-    }
-    for key in ("engine_backend", "engine_index", "engine_idx", "replica_rank", "node_rank", "vllm_version"):
-        value = payload.get(key, context.get(key))
-        if value is not None:
-            args[key] = str(value)
-    return args
+    return {"value": payload.get("value")}
 
 
 def _add_selected_vllm_counter_events(
@@ -317,7 +300,7 @@ def _add_selected_vllm_counter_events(
                 "ts": record.get("time_unix_ns", 0) / 1000,
                 "pid": pid,
                 "tid": 1,
-                "args": _selected_counter_args(record, server_id, engine_id),
+                "args": _selected_counter_args(record),
             }
         )
 
@@ -353,7 +336,7 @@ def records_to_active_counter_perfetto(
                     "ts": sample_ts / 1000,
                     "pid": pid,
                     "tid": 1,
-                    "args": _active_counter_args(group_id, span_name, active),
+                    "args": _active_counter_args(active),
                 }
             )
     _add_selected_vllm_counter_events(events, process_ids, record_list, server_ids)
