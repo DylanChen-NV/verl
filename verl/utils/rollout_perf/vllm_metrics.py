@@ -317,10 +317,10 @@ class RolloutPerfVLLMSampledMetrics:
 class RolloutPerfRequestKVMetricsSampler:
     """Sample active request KV lengths from server-side request progress."""
 
-    LOGICAL_AVG = "vllm/kv_len_logical_avg"
-    LOGICAL_P95 = "vllm/kv_len_logical_p95"
-    ALLOC_EST_AVG = "vllm/kv_len_alloc_est_avg"
-    ALLOC_EST_P95 = "vllm/kv_len_alloc_est_p95"
+    LOGICAL_AVG = "vllm/kv_len_per_request_logical_avg"
+    LOGICAL_P95 = "vllm/kv_len_per_request_logical_p95"
+    ALLOC_EST_AVG = "vllm/kv_len_per_request_alloc_est_avg"
+    ALLOC_EST_P95 = "vllm/kv_len_per_request_alloc_est_p95"
 
     def __init__(self, *, context: dict[str, Any], sample_interval_ms: int, block_size: Optional[int] = None):
         self.context = dict(context)
