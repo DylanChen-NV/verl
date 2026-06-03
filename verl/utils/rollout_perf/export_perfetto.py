@@ -78,20 +78,21 @@ GLOBAL_VLLM_ENGINE_SUM_COUNTERS = {
 
 GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS = {
     ("vllm/kv_cache_usage_%", "window_avg"): (
-        ("vllm/kv_cache_usage_%_mean", "window_avg"),
-        ("vllm/kv_cache_usage_%_max", "window_avg"),
+        ("vllm/kv_cache_usage_%", "window_avg_mean"),
+        ("vllm/kv_cache_usage_%", "window_avg_max"),
     ),
+}
+
+GLOBAL_VLLM_ENGINE_WEIGHT_COUNTER = ("vllm/requests_running", "window_avg")
+
+GLOBAL_VLLM_ENGINE_WEIGHTED_MEAN_COUNTERS = {
     ("vllm/kv_len_per_request_logical", "window_avg"): (
-        ("vllm/kv_len_per_request_logical/engine_mean", "window_avg"),
-        ("vllm/kv_len_per_request_logical/engine_max", "window_avg"),
-    ),
-    ("vllm/kv_len_per_request_logical", "window_p95"): (
-        ("vllm/kv_len_per_request_logical/engine_mean", "window_p95"),
-        ("vllm/kv_len_per_request_logical/engine_max", "window_p95"),
+        "vllm/kv_len_per_request_logical",
+        "window_avg_weighted_mean",
     ),
     ("vllm/kv_len_per_request_alloc_est", "window_avg"): (
-        ("vllm/kv_len_per_request_alloc_est/engine_mean", "window_avg"),
-        ("vllm/kv_len_per_request_alloc_est/engine_max", "window_avg"),
+        "vllm/kv_len_per_request_alloc_est",
+        "window_avg_weighted_mean",
     ),
 }
 
@@ -368,6 +369,29 @@ def _counter_args(arg_name: str, value: float) -> dict[str, Any]:
     return {arg_name: value}
 
 
+def _global_counter_sum_arg(arg_name: str) -> str:
+    return f"{arg_name}_sum"
+
+
+def _global_weighted_mean(
+    values_by_engine: dict[tuple[str, str, str], float],
+    counter_key: tuple[str, str],
+) -> float:
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for engine_id, output_name, arg_name in values_by_engine:
+        if (output_name, arg_name) != counter_key:
+            continue
+        weight = values_by_engine.get((engine_id, *GLOBAL_VLLM_ENGINE_WEIGHT_COUNTER), 0.0)
+        if weight <= 0:
+            continue
+        weighted_sum += values_by_engine[(engine_id, output_name, arg_name)] * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return 0.0
+    return weighted_sum / total_weight
+
+
 def _mean(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -581,6 +605,7 @@ def _add_global_vllm_engine_sampled_counter_events(
     pid = _add_counter_metadata(events, process_ids, "global/vllm_engine")
     for sample_ts in sample_timestamps:
         values_by_counter: dict[tuple[str, str], list[float]] = defaultdict(list)
+        values_by_engine: dict[tuple[str, str, str], float] = {}
         for key, samples in sorted(series.items()):
             engine_id, output_name, arg_name = key
             server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id), [])
@@ -592,7 +617,9 @@ def _add_global_vllm_engine_sampled_counter_events(
                 current_values[key] = samples[sample_index][1]
                 sample_index += 1
             sample_indices[key] = sample_index
-            values_by_counter[(output_name, arg_name)].append(current_values[key])
+            counter_key = (output_name, arg_name)
+            values_by_counter[counter_key].append(current_values[key])
+            values_by_engine[(engine_id, output_name, arg_name)] = current_values[key]
         for counter_key, values in sorted(values_by_counter.items()):
             if counter_key in GLOBAL_VLLM_ENGINE_SUM_COUNTERS:
                 output_name, arg_name = counter_key
@@ -604,7 +631,7 @@ def _add_global_vllm_engine_sampled_counter_events(
                         "ts": sample_ts / 1000,
                         "pid": pid,
                         "tid": 1,
-                        "args": _counter_args(arg_name, float(sum(values))),
+                        "args": _counter_args(_global_counter_sum_arg(arg_name), float(sum(values))),
                     }
                 )
             elif counter_key in GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS:
@@ -621,6 +648,19 @@ def _add_global_vllm_engine_sampled_counter_events(
                             "args": _counter_args(arg_name, float(value)),
                         }
                     )
+            elif counter_key in GLOBAL_VLLM_ENGINE_WEIGHTED_MEAN_COUNTERS:
+                output_name, arg_name = GLOBAL_VLLM_ENGINE_WEIGHTED_MEAN_COUNTERS[counter_key]
+                events.append(
+                    {
+                        "name": output_name,
+                        "cat": "rollout_perf_counter_global",
+                        "ph": "C",
+                        "ts": sample_ts / 1000,
+                        "pid": pid,
+                        "tid": 1,
+                        "args": _counter_args(arg_name, _global_weighted_mean(values_by_engine, counter_key)),
+                    }
+                )
 
 
 def _add_global_vllm_engine_counter_events(
