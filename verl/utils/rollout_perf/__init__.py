@@ -16,6 +16,8 @@
 from verl.utils.rollout_perf.collector import (
     emit_counter,
     emit_event,
+    emit_unsampled_counter,
+    emit_unsampled_event,
     get_trace_context_for_rpc,
     init_rollout_perf,
     is_current_trace_enabled,
@@ -31,6 +33,8 @@ __all__ = [
     "current_trace_context",
     "emit_counter",
     "emit_event",
+    "emit_unsampled_counter",
+    "emit_unsampled_event",
     "get_trace_context_for_rpc",
     "init_rollout_perf",
     "is_current_trace_enabled",

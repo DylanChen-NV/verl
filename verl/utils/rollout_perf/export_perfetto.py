@@ -162,6 +162,54 @@ def _add_counter_metadata(events: list[dict[str, Any]], process_ids: dict[str, i
     return process_ids[process]
 
 
+def _raw_counter_args(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload") or {}
+    context = record.get("context") or {}
+    args = {"value": payload.get("value")}
+    for key in (
+        "engine_backend",
+        "engine_index",
+        "engine_idx",
+        "replica_rank",
+        "node_rank",
+        "vllm_version",
+        "priority",
+    ):
+        value = payload.get(key, context.get(key))
+        if value is not None:
+            args[key] = str(value)
+    priority = record.get("priority")
+    if priority is not None:
+        args["priority"] = str(priority)
+    args["counter_source"] = "raw"
+    return args
+
+
+def _add_raw_counter_events(
+    events: list[dict[str, Any]],
+    process_ids: dict[str, int],
+    records: Iterable[dict[str, Any]],
+) -> None:
+    for record in records:
+        if record.get("record_type") != "counter":
+            continue
+        name = record.get("name", "counter")
+        if not name.startswith("vllm/"):
+            continue
+        pid = _add_counter_metadata(events, process_ids, _process_name(record))
+        events.append(
+            {
+                "name": name,
+                "cat": "rollout_perf_counter",
+                "ph": "C",
+                "ts": record.get("time_unix_ns", 0) / 1000,
+                "pid": pid,
+                "tid": 1,
+                "args": _raw_counter_args(record),
+            }
+        )
+
+
 def _process_span_groups(
     records: Iterable[dict[str, Any]],
     counter_scope: str,
@@ -235,7 +283,8 @@ def records_to_active_counter_perfetto(
     if sample_interval_ns <= 0:
         raise ValueError("--sample-interval-ms is too small")
 
-    groups = _process_span_groups(records, counter_scope)
+    record_list = list(records)
+    groups = _process_span_groups(record_list, counter_scope)
     events: list[dict[str, Any]] = []
     process_ids: dict[str, int] = {}
 
@@ -261,6 +310,7 @@ def records_to_active_counter_perfetto(
                     "args": args,
                 }
             )
+    _add_raw_counter_events(events, process_ids, record_list)
     return {"traceEvents": events}
 
 

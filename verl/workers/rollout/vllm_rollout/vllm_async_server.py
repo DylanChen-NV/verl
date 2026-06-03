@@ -40,6 +40,7 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.rollout_perf import init_rollout_perf, push_trace_context, start_span
+from verl.utils.rollout_perf.vllm_metrics import RolloutPerfVLLMStatLogger
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -144,6 +145,7 @@ class vLLMHttpServer:
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        os.environ["VERL_NODE_RANK"] = str(node_rank)
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
         # Without this, two concurrent verl jobs on the same node both bind
@@ -431,6 +433,14 @@ class vLLMHttpServer:
             kwargs["enable_log_requests"] = engine_args.enable_log_requests
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
+        if self.config.perf_trace.engine_internal.enable:
+            if "stat_loggers" in fn_args:
+                kwargs["stat_loggers"] = [RolloutPerfVLLMStatLogger]
+            else:
+                logger.warning(
+                    "rollout perf trace engine_internal is enabled, but AsyncLLM.from_vllm_config "
+                    "does not expose stat_loggers; vLLM internal counters will not be collected."
+                )
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 

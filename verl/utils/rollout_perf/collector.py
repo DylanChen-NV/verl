@@ -70,6 +70,57 @@ def emit_counter(name: str, value: float, payload: Optional[dict[str, Any]] = No
     )
 
 
+def emit_unsampled_event(
+    name: str,
+    payload: Optional[dict[str, Any]] = None,
+    *,
+    priority: str = "P0",
+    context: Optional[dict[str, Any]] = None,
+) -> None:
+    """Emit an event whenever the process-local writer is enabled.
+
+    This is for engine/process-level telemetry that should not be tied to
+    trajectory sampling decisions.
+    """
+    if not writer_enabled():
+        return
+    write_record(
+        {
+            "record_type": "event",
+            "name": name,
+            "priority": priority,
+            "context": context if context is not None else current_trace_context(),
+            "payload": payload or {},
+        }
+    )
+
+
+def emit_unsampled_counter(
+    name: str,
+    value: float,
+    payload: Optional[dict[str, Any]] = None,
+    *,
+    priority: str = "P0",
+    context: Optional[dict[str, Any]] = None,
+) -> None:
+    """Emit a counter whenever the process-local writer is enabled.
+
+    Unlike emit_counter(), this intentionally bypasses trace_sampled so
+    engine-level counters can represent the full engine workload.
+    """
+    if not writer_enabled():
+        return
+    write_record(
+        {
+            "record_type": "counter",
+            "name": name,
+            "priority": priority,
+            "context": context if context is not None else current_trace_context(),
+            "payload": {"value": value, **(payload or {})},
+        }
+    )
+
+
 class TraceSpan:
     """A complete-event span that writes one JSONL record when finished."""
 
