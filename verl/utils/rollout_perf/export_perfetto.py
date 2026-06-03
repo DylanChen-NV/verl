@@ -29,57 +29,69 @@ AGENT_COUNTER_SPANS = {
 VLLM_SERVER_COUNTER_SPANS = {"vllm_engine_request"}
 
 VLLM_SAMPLED_COUNTERS = {
-    "vllm/scheduler/requests_running": ("vllm/requests_running", 1.0),
-    "vllm/scheduler/requests_waiting": ("vllm/requests_waiting", 1.0),
+    # Variant tuple fields: output name, payload value key, Perfetto arg key, scale.
+    "vllm/scheduler/requests_running": (("vllm/requests_running", "value", "window_avg", 1.0),),
+    "vllm/scheduler/requests_waiting": (("vllm/requests_waiting", "value", "window_avg", 1.0),),
     # Backward compatibility for traces collected before the requests_* rename.
-    "vllm/scheduler/running_requests": ("vllm/requests_running", 1.0),
-    "vllm/scheduler/waiting_requests": ("vllm/requests_waiting", 1.0),
-    "vllm/kv_cache/usage_ratio": ("vllm/kv_cache_usage_%", 100.0),
-    "vllm/kv_len_per_request_logical_avg": ("vllm/kv_len_per_request_logical_avg", 1.0),
-    "vllm/kv_len_per_request_logical_p95": ("vllm/kv_len_per_request_logical_p95", 1.0),
-    "vllm/kv_len_per_request_alloc_est_avg": ("vllm/kv_len_per_request_alloc_est_avg", 1.0),
-    "vllm/kv_len_per_request_alloc_est_p95": ("vllm/kv_len_per_request_alloc_est_p95", 1.0),
+    "vllm/scheduler/running_requests": (("vllm/requests_running", "value", "window_avg", 1.0),),
+    "vllm/scheduler/waiting_requests": (("vllm/requests_waiting", "value", "window_avg", 1.0),),
+    "vllm/kv_cache/usage_ratio": (("vllm/kv_cache_usage_%", "value", "window_avg", 100.0),),
+    "vllm/kv_len_per_request_logical_avg": (
+        ("vllm/kv_len_per_request_logical", "value", "window_avg", 1.0),
+    ),
+    "vllm/kv_len_per_request_logical_p95": (
+        ("vllm/kv_len_per_request_logical", "value", "window_p95", 1.0),
+    ),
+    "vllm/kv_len_per_request_alloc_est_avg": (
+        ("vllm/kv_len_per_request_alloc_est", "value", "window_avg", 1.0),
+    ),
     # Backward compatibility for traces collected before the per-request rename.
-    "vllm/kv_len_logical_avg": ("vllm/kv_len_per_request_logical_avg", 1.0),
-    "vllm/kv_len_logical_p95": ("vllm/kv_len_per_request_logical_p95", 1.0),
-    "vllm/kv_len_alloc_est_avg": ("vllm/kv_len_per_request_alloc_est_avg", 1.0),
-    "vllm/kv_len_alloc_est_p95": ("vllm/kv_len_per_request_alloc_est_p95", 1.0),
-    "vllm/iteration/batch_requests_total": ("vllm/requests_batch", 1.0),
-    "vllm/iteration/prefill_requests": ("vllm/requests_prefill", 1.0),
-    "vllm/iteration/decode_requests": ("vllm/requests_decode", 1.0),
-    "vllm/iteration/batch_tokens_total": ("vllm/tokens_batch", 1.0),
-    "vllm/iteration/prefill_tokens_computed": ("vllm/tokens_prefill", 1.0),
-    "vllm/iteration/decode_tokens": ("vllm/tokens_decode", 1.0),
+    "vllm/kv_len_logical_avg": (("vllm/kv_len_per_request_logical", "value", "window_avg", 1.0),),
+    "vllm/kv_len_logical_p95": (("vllm/kv_len_per_request_logical", "value", "window_p95", 1.0),),
+    "vllm/kv_len_alloc_est_avg": (("vllm/kv_len_per_request_alloc_est", "value", "window_avg", 1.0),),
+    "vllm/iteration/batch_requests_total": (("vllm/requests_batch", "value", "window_avg", 1.0),),
+    "vllm/iteration/prefill_requests": (
+        ("vllm/requests_prefill", "value", "window_avg", 1.0),
+        ("vllm/requests_prefill", "max_value", "window_max", 1.0),
+    ),
+    "vllm/iteration/decode_requests": (("vllm/requests_decode", "value", "window_avg", 1.0),),
+    "vllm/iteration/batch_tokens_total": (("vllm/tokens_batch", "value", "window_avg", 1.0),),
+    "vllm/iteration/prefill_tokens_computed": (
+        ("vllm/tokens_prefill", "value", "window_avg", 1.0),
+        ("vllm/tokens_prefill", "max_value", "window_max", 1.0),
+    ),
+    "vllm/iteration/decode_tokens": (("vllm/tokens_decode", "value", "window_avg", 1.0),),
 }
 
 GLOBAL_VLLM_ENGINE_SUM_COUNTERS = {
-    "vllm/requests_running",
-    "vllm/requests_waiting",
-    "vllm/requests_batch",
-    "vllm/requests_prefill",
-    "vllm/requests_decode",
-    "vllm/tokens_batch",
-    "vllm/tokens_prefill",
-    "vllm/tokens_decode",
+    ("vllm/requests_running", "window_avg"),
+    ("vllm/requests_waiting", "window_avg"),
+    ("vllm/requests_batch", "window_avg"),
+    ("vllm/requests_prefill", "window_avg"),
+    ("vllm/requests_prefill", "window_max"),
+    ("vllm/requests_decode", "window_avg"),
+    ("vllm/tokens_batch", "window_avg"),
+    ("vllm/tokens_prefill", "window_avg"),
+    ("vllm/tokens_prefill", "window_max"),
+    ("vllm/tokens_decode", "window_avg"),
 }
 
 GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS = {
-    "vllm/kv_cache_usage_%": ("vllm/kv_cache_usage_%_mean", "vllm/kv_cache_usage_%_max"),
-    "vllm/kv_len_per_request_logical_avg": (
-        "vllm/kv_len_per_request_logical_avg_mean",
-        "vllm/kv_len_per_request_logical_avg_max",
+    ("vllm/kv_cache_usage_%", "window_avg"): (
+        ("vllm/kv_cache_usage_%_mean", "window_avg"),
+        ("vllm/kv_cache_usage_%_max", "window_avg"),
     ),
-    "vllm/kv_len_per_request_logical_p95": (
-        "vllm/kv_len_per_request_logical_p95_mean",
-        "vllm/kv_len_per_request_logical_p95_max",
+    ("vllm/kv_len_per_request_logical", "window_avg"): (
+        ("vllm/kv_len_per_request_logical/engine_mean", "window_avg"),
+        ("vllm/kv_len_per_request_logical/engine_max", "window_avg"),
     ),
-    "vllm/kv_len_per_request_alloc_est_avg": (
-        "vllm/kv_len_per_request_alloc_est_avg_mean",
-        "vllm/kv_len_per_request_alloc_est_avg_max",
+    ("vllm/kv_len_per_request_logical", "window_p95"): (
+        ("vllm/kv_len_per_request_logical/engine_mean", "window_p95"),
+        ("vllm/kv_len_per_request_logical/engine_max", "window_p95"),
     ),
-    "vllm/kv_len_per_request_alloc_est_p95": (
-        "vllm/kv_len_per_request_alloc_est_p95_mean",
-        "vllm/kv_len_per_request_alloc_est_p95_max",
+    ("vllm/kv_len_per_request_alloc_est", "window_avg"): (
+        ("vllm/kv_len_per_request_alloc_est/engine_mean", "window_avg"),
+        ("vllm/kv_len_per_request_alloc_est/engine_max", "window_avg"),
     ),
 }
 
@@ -352,8 +364,8 @@ def _active_counter_args(active: int) -> dict[str, Any]:
     return {"window_max": active}
 
 
-def _counter_args(value: float) -> dict[str, Any]:
-    return {"window_avg": value}
+def _counter_args(arg_name: str, value: float) -> dict[str, Any]:
+    return {arg_name: value}
 
 
 def _mean(values: list[float]) -> float:
@@ -466,8 +478,8 @@ def _engine_id(record: dict[str, Any], server_ids: dict[tuple[str, int], str]) -
     return f"{server_ids[source_key]}e{_engine_index(record)}"
 
 
-def _numeric_payload_value(record: dict[str, Any]) -> float | None:
-    value = (record.get("payload") or {}).get("value")
+def _numeric_payload_value(record: dict[str, Any], payload_key: str = "value") -> float | None:
+    value = (record.get("payload") or {}).get(payload_key)
     if isinstance(value, bool):
         return float(int(value))
     if isinstance(value, (int, float)):
@@ -479,24 +491,26 @@ def _collect_vllm_sampled_counter_series(
     records: Iterable[dict[str, Any]],
     server_ids: dict[tuple[str, int], str],
     server_active_spans: dict[str, list[tuple[int, int]]],
-) -> dict[tuple[str, str], list[tuple[int, float]]]:
-    series: dict[tuple[str, str], list[tuple[int, float]]] = {}
+) -> dict[tuple[str, str, str], list[tuple[int, float]]]:
+    series: dict[tuple[str, str, str], list[tuple[int, float]]] = {}
     for record in records:
         if record.get("record_type") != "counter":
             continue
-        mapping = VLLM_SAMPLED_COUNTERS.get(record.get("name"))
-        if mapping is None:
+        variants = VLLM_SAMPLED_COUNTERS.get(record.get("name"))
+        if variants is None:
             continue
         engine_id = _engine_id(record, server_ids)
-        value = _numeric_payload_value(record)
-        if engine_id is None or value is None:
+        if engine_id is None:
             continue
         timestamp = int(record.get("time_unix_ns", 0))
         server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id))
         if server_spans and not _timestamp_in_spans(timestamp, server_spans):
             continue
-        output_name, scale = mapping
-        series.setdefault((engine_id, output_name), []).append((timestamp, value * scale))
+        for output_name, payload_key, arg_name, scale in variants:
+            value = _numeric_payload_value(record, payload_key)
+            if value is None:
+                continue
+            series.setdefault((engine_id, output_name, arg_name), []).append((timestamp, value * scale))
     for samples in series.values():
         samples.sort()
     return series
@@ -522,7 +536,7 @@ def _add_vllm_sampled_counter_events(
     sample_interval_ns: int,
 ) -> None:
     series = _collect_vllm_sampled_counter_series(records, server_ids, server_active_spans)
-    for (engine_id, output_name), samples in sorted(series.items()):
+    for (engine_id, output_name, arg_name), samples in sorted(series.items()):
         sample_timestamps = _counter_sample_timestamps_for_engine(
             engine_id, server_active_spans, trace_bounds, sample_interval_ns
         )
@@ -543,7 +557,7 @@ def _add_vllm_sampled_counter_events(
                     "ts": sample_ts / 1000,
                     "pid": pid,
                     "tid": 1,
-                    "args": _counter_args(current_value),
+                    "args": _counter_args(arg_name, current_value),
                 }
             )
 
@@ -566,9 +580,9 @@ def _add_global_vllm_engine_sampled_counter_events(
     current_values = {key: 0.0 for key in series}
     pid = _add_counter_metadata(events, process_ids, "global/vllm_engine")
     for sample_ts in sample_timestamps:
-        values_by_name: dict[str, list[float]] = defaultdict(list)
+        values_by_counter: dict[tuple[str, str], list[float]] = defaultdict(list)
         for key, samples in sorted(series.items()):
-            engine_id, output_name = key
+            engine_id, output_name, arg_name = key
             server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id), [])
             if not _timestamp_in_spans(sample_ts, server_spans):
                 current_values[key] = 0.0
@@ -578,9 +592,10 @@ def _add_global_vllm_engine_sampled_counter_events(
                 current_values[key] = samples[sample_index][1]
                 sample_index += 1
             sample_indices[key] = sample_index
-            values_by_name[output_name].append(current_values[key])
-        for output_name, values in sorted(values_by_name.items()):
-            if output_name in GLOBAL_VLLM_ENGINE_SUM_COUNTERS:
+            values_by_counter[(output_name, arg_name)].append(current_values[key])
+        for counter_key, values in sorted(values_by_counter.items()):
+            if counter_key in GLOBAL_VLLM_ENGINE_SUM_COUNTERS:
+                output_name, arg_name = counter_key
                 events.append(
                     {
                         "name": output_name,
@@ -589,12 +604,12 @@ def _add_global_vllm_engine_sampled_counter_events(
                         "ts": sample_ts / 1000,
                         "pid": pid,
                         "tid": 1,
-                        "args": _counter_args(float(sum(values))),
+                        "args": _counter_args(arg_name, float(sum(values))),
                     }
                 )
-            elif output_name in GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS:
-                mean_name, max_name = GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS[output_name]
-                for name, value in ((mean_name, _mean(values)), (max_name, max(values))):
+            elif counter_key in GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS:
+                mean_counter, max_counter = GLOBAL_VLLM_ENGINE_DISTRIBUTION_COUNTERS[counter_key]
+                for (name, arg_name), value in ((mean_counter, _mean(values)), (max_counter, max(values))):
                     events.append(
                         {
                             "name": name,
@@ -603,7 +618,7 @@ def _add_global_vllm_engine_sampled_counter_events(
                             "ts": sample_ts / 1000,
                             "pid": pid,
                             "tid": 1,
-                            "args": _counter_args(float(value)),
+                            "args": _counter_args(arg_name, float(value)),
                         }
                     )
 
