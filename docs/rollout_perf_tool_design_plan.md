@@ -168,6 +168,51 @@ wandb_url=https://wandb.ai/czqing422-sjtu/verl-fully-async-smoke/runs/retool-vll
 
 P1 closed-loop replay and P2 offline analyze/alternate replay modes are not implemented yet.
 
+### Active Counter Global Views (2026-06-03)
+
+The `active_counters` Perfetto exporter now emits global summary processes in
+addition to per-worker/per-server/per-engine lanes:
+
+```text
+global/agent_loop_worker
+global/vllm_server
+global/vllm_engine
+```
+
+The global views are exporter-only derived counters; the online collector does
+not write additional global records. Agent and server global counters are derived
+from span intervals. Engine global counters are derived from sampled per-engine
+counters. Request/token counters are summed, while cache usage and
+`kv_len_per_request_*` counters emit mean and max.
+
+KV length counters were renamed to make the estimate explicit:
+
+```text
+vllm/kv_len_per_request_logical_avg
+vllm/kv_len_per_request_logical_p95
+vllm/kv_len_per_request_alloc_est_avg
+vllm/kv_len_per_request_alloc_est_p95
+```
+
+The exporter maps older raw names such as `vllm/kv_len_logical_avg` to the new
+Perfetto names for backward compatibility. New raw traces use the new names.
+
+Latest validation:
+
+```text
+workspace=exp_rollout_perf_trace_retool_global_3step_epoch2
+run_id=exp_rollout_perf_global_retool_2n8g_3step_epoch2_20260603
+slurm_job_id=12458925
+job_state=COMPLETED
+actual_training_steps=3
+trace_records=1730
+perfetto_active_counter_events=16252
+old_kv_names=[]
+last_global_requests_running=0.0
+last_global_requests_waiting=0.0
+wandb_url=https://wandb.ai/czqing422-sjtu/verl-fully-async-smoke/runs/retool-vllm020-2n8g-12458925
+```
+
 
 ### 新增模块
 
