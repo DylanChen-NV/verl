@@ -34,10 +34,12 @@ VLLM_STATE_COUNTERS = {
 }
 
 VLLM_BUCKET_SUM_COUNTERS = {
-    "vllm/iteration/batch_requests_total": "vllm/batch_requests",
-    "vllm/iteration/prefill_tokens_computed": "vllm/prefill_tokens",
-    "vllm/iteration/decode_tokens": "vllm/decode_tokens",
-    "vllm/iteration/batch_tokens_total": "vllm/batch_tokens",
+    "vllm/iteration/batch_requests_total": "vllm/requests_batch",
+    "vllm/iteration/prefill_requests": "vllm/requests_prefill",
+    "vllm/iteration/decode_requests": "vllm/requests_decode",
+    "vllm/iteration/batch_tokens_total": "vllm/tokens_batch",
+    "vllm/iteration/prefill_tokens_computed": "vllm/tokens_prefill",
+    "vllm/iteration/decode_tokens": "vllm/tokens_decode",
 }
 
 VLLM_FOCUSED_COUNTERS = set(VLLM_STATE_COUNTERS) | set(VLLM_BUCKET_SUM_COUNTERS)
