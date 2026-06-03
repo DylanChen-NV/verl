@@ -298,7 +298,7 @@ def _add_global_span_counter_events(
 ) -> None:
     for (process, span_name), spans in sorted(_global_span_groups(records).items()):
         pid = _add_counter_metadata(events, process_ids, process)
-        for sample_ts, active in _iter_counter_samples(spans, sample_interval_ns):
+        for sample_ts, active in _iter_counter_window_max_samples(spans, sample_interval_ns):
             events.append(
                 {
                     "name": f"active/{span_name}",
@@ -312,10 +312,15 @@ def _add_global_span_counter_events(
             )
 
 
-def _iter_counter_samples(
+def _iter_counter_window_max_samples(
     spans: list[tuple[int, int]],
     sample_interval_ns: int,
 ) -> Iterable[tuple[int, int]]:
+    """Yield max active span count for each sampling window.
+
+    The timestamp is the end of the window, so the emitted value describes the
+    preceding time slice instead of a single instantaneous sample.
+    """
     if not spans:
         return
     events = []
@@ -328,33 +333,27 @@ def _iter_counter_samples(
 
     event_index = 0
     active = 0
-
-    def process_events_until(timestamp: int) -> int:
-        nonlocal event_index, active
-        while event_index < len(events) and events[event_index][0] <= timestamp:
+    window_start = min_start
+    while window_start < max_end:
+        window_end = min(((window_start // sample_interval_ns) + 1) * sample_interval_ns, max_end)
+        while event_index < len(events) and events[event_index][0] <= window_start:
             active += events[event_index][1]
             event_index += 1
-        return active
-
-    last_sample_ts = min_start
-    yield last_sample_ts, process_events_until(last_sample_ts)
-
-    sample_ts = ((min_start // sample_interval_ns) + 1) * sample_interval_ns
-    while sample_ts < max_end:
-        yield sample_ts, process_events_until(sample_ts)
-        last_sample_ts = sample_ts
-        sample_ts += sample_interval_ns
-
-    if max_end != last_sample_ts:
-        yield max_end, process_events_until(max_end)
+        window_max = active
+        while event_index < len(events) and events[event_index][0] < window_end:
+            active += events[event_index][1]
+            window_max = max(window_max, active)
+            event_index += 1
+        yield window_end, window_max
+        window_start = window_end
 
 
 def _active_counter_args(active: int) -> dict[str, Any]:
-    return {"value": active}
+    return {"window_max": active}
 
 
 def _counter_args(value: float) -> dict[str, Any]:
-    return {"value": value}
+    return {"window_avg": value}
 
 
 def _mean(values: list[float]) -> float:
@@ -663,7 +662,7 @@ def records_to_active_counter_perfetto(
     _add_global_span_counter_events(events, process_ids, record_list, sample_interval_ns)
     for (process, span_name, group_id), spans in sorted(groups.items()):
         pid = _add_counter_metadata(events, process_ids, process)
-        for sample_ts, active in _iter_counter_samples(spans, sample_interval_ns):
+        for sample_ts, active in _iter_counter_window_max_samples(spans, sample_interval_ns):
             events.append(
                 {
                     "name": f"active/{span_name}",
