@@ -131,6 +131,44 @@ verl 当前已经有部分 rollout 相关统计：
 
 ## 方案：P0 采集和可视化
 
+## Current P0 Implementation Snapshot (2026-06-03)
+
+Implemented P0 pieces:
+
+```text
+Collection spans: trajectory, llm_turn, tool_turn, tool_call, llm_client_request, vllm_engine_request.
+Collection counters: vLLM scheduler state, iteration bucket totals, KV cache usage, logical/allocated KV length avg and p95.
+Exporters: full Perfetto JSON trace and focused active_counters Perfetto JSON trace.
+Configuration: actor_rollout_ref.rollout.perf_trace.engine_internal.sample_interval_ms, default 500 ms.
+```
+
+vLLM internal counter semantics:
+
+```text
+Scheduler/iteration/KV counters are emitted only while the local vLLM server process has active rollout requests.
+When the final active rollout request finishes, pending buckets are flushed and final zero state counters are emitted.
+running_requests/waiting_requests are named requests_running/requests_waiting in both new raw records and focused Perfetto output.
+The focused active_counters exporter samples vLLM counters over each server's active vllm_engine_request windows.
+Raw JSONL remains the source of truth and keeps host/pid/rank/sample interval metadata.
+```
+
+Latest validation:
+
+```text
+workspace=exp_rollout_perf_trace_retool_vllm020_smoke
+run_id=exp_rollout_perf_active_gated_retool_2n8g_20260603_100ms
+slurm_job_id=12457801
+job_state=COMPLETED
+trace_records=826
+perfetto_active_counter_events=9967
+final_requests_running=0.0 on all four vLLM server lanes
+final_requests_waiting=0.0 on all four vLLM server lanes
+wandb_url=https://wandb.ai/czqing422-sjtu/verl-fully-async-smoke/runs/retool-vllm020-2n8g-12457801
+```
+
+P1 closed-loop replay and P2 offline analyze/alternate replay modes are not implemented yet.
+
+
 ### 新增模块
 
 建议新增：
