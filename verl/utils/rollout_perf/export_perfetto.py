@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import json
+from bisect import bisect_right
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,8 +29,11 @@ AGENT_COUNTER_SPANS = {
 VLLM_SERVER_COUNTER_SPANS = {"vllm_engine_request"}
 
 VLLM_STATE_COUNTERS = {
-    "vllm/scheduler/running_requests": ("vllm/running_requests", 1.0),
-    "vllm/scheduler/waiting_requests": ("vllm/waiting_requests", 1.0),
+    "vllm/scheduler/requests_running": ("vllm/requests_running", 1.0),
+    "vllm/scheduler/requests_waiting": ("vllm/requests_waiting", 1.0),
+    # Backward compatibility for traces collected before the requests_* rename.
+    "vllm/scheduler/running_requests": ("vllm/requests_running", 1.0),
+    "vllm/scheduler/waiting_requests": ("vllm/requests_waiting", 1.0),
     "vllm/kv_cache/usage_ratio": ("vllm/kv_cache_usage_%", 100.0),
     "vllm/kv_len_logical_avg": ("vllm/kv_len_logical_avg", 1.0),
     "vllm/kv_len_logical_p95": ("vllm/kv_len_logical_p95", 1.0),
@@ -310,6 +314,75 @@ def _iter_sample_timestamps(start_ns: int, end_ns: int, sample_interval_ns: int)
     yield end_ns
 
 
+def _merge_intervals(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if end < start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _iter_sample_timestamps_for_spans(
+    spans: list[tuple[int, int]],
+    sample_interval_ns: int,
+) -> Iterable[int]:
+    for start, end in _merge_intervals(spans):
+        last_sample_ts = start
+        yield start
+        sample_ts = ((start // sample_interval_ns) + 1) * sample_interval_ns
+        while sample_ts < end:
+            yield sample_ts
+            last_sample_ts = sample_ts
+            sample_ts += sample_interval_ns
+        if end != last_sample_ts:
+            yield end
+
+
+def _timestamp_in_spans(timestamp: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= timestamp <= end for start, end in spans)
+
+
+def _server_id_from_engine_id(engine_id: str) -> str:
+    return engine_id.split("e", 1)[0]
+
+
+def _collect_server_active_spans(
+    records: Iterable[dict[str, Any]],
+    server_ids: dict[tuple[str, int], str],
+) -> dict[str, list[tuple[int, int]]]:
+    spans_by_server: dict[str, list[tuple[int, int]]] = {}
+    for record in records:
+        if record.get("record_type") != "span" or record.get("name") not in VLLM_SERVER_COUNTER_SPANS:
+            continue
+        key = _source_key(record)
+        server_id = server_ids.get(key)
+        bounds = _span_bounds(record)
+        if server_id is None or bounds is None:
+            continue
+        spans_by_server.setdefault(server_id, []).append(bounds)
+    return {server_id: _merge_intervals(spans) for server_id, spans in spans_by_server.items()}
+
+
+def _counter_sample_timestamps_for_engine(
+    engine_id: str,
+    server_active_spans: dict[str, list[tuple[int, int]]],
+    trace_bounds: tuple[int, int] | None,
+    sample_interval_ns: int,
+) -> list[int]:
+    server_id = _server_id_from_engine_id(engine_id)
+    spans = server_active_spans.get(server_id)
+    if spans:
+        return list(_iter_sample_timestamps_for_spans(spans, sample_interval_ns))
+    if trace_bounds is None:
+        return []
+    start_ns, end_ns = trace_bounds
+    return list(_iter_sample_timestamps(start_ns, end_ns, sample_interval_ns))
+
+
 def _engine_id(record: dict[str, Any], server_ids: dict[tuple[str, int], str]) -> str | None:
     source_key = _source_key(record)
     if source_key not in server_ids:
@@ -331,11 +404,10 @@ def _add_vllm_state_counter_events(
     process_ids: dict[str, int],
     records: Iterable[dict[str, Any]],
     server_ids: dict[tuple[str, int], str],
+    server_active_spans: dict[str, list[tuple[int, int]]],
     trace_bounds: tuple[int, int] | None,
     sample_interval_ns: int,
 ) -> None:
-    if trace_bounds is None:
-        return
     series: dict[tuple[str, str], list[tuple[int, float]]] = {}
     for record in records:
         if record.get("record_type") != "counter":
@@ -350,9 +422,12 @@ def _add_vllm_state_counter_events(
         output_name, scale = mapping
         series.setdefault((engine_id, output_name), []).append((int(record.get("time_unix_ns", 0)), value * scale))
 
-    start_ns, end_ns = trace_bounds
-    sample_timestamps = list(_iter_sample_timestamps(start_ns, end_ns, sample_interval_ns))
     for (engine_id, output_name), samples in sorted(series.items()):
+        sample_timestamps = _counter_sample_timestamps_for_engine(
+            engine_id, server_active_spans, trace_bounds, sample_interval_ns
+        )
+        if not sample_timestamps:
+            continue
         samples.sort()
         sample_index = 0
         current_value = 0.0
@@ -379,14 +454,11 @@ def _add_vllm_bucket_sum_counter_events(
     process_ids: dict[str, int],
     records: Iterable[dict[str, Any]],
     server_ids: dict[tuple[str, int], str],
+    server_active_spans: dict[str, list[tuple[int, int]]],
     trace_bounds: tuple[int, int] | None,
     sample_interval_ns: int,
 ) -> None:
-    if trace_bounds is None:
-        return
-    start_ns, end_ns = trace_bounds
-    bucket_count = ((end_ns - start_ns) // sample_interval_ns) + 1
-    series: dict[tuple[str, str], list[float]] = {}
+    raw_series: dict[tuple[str, str], list[tuple[int, float]]] = {}
     for record in records:
         if record.get("record_type") != "counter":
             continue
@@ -397,16 +469,25 @@ def _add_vllm_bucket_sum_counter_events(
         value = _numeric_payload_value(record)
         if engine_id is None or value is None:
             continue
-        bucket_index = max(0, min((int(record.get("time_unix_ns", 0)) - start_ns) // sample_interval_ns, bucket_count - 1))
-        buckets = series.setdefault((engine_id, output_name), [0.0] * bucket_count)
-        buckets[bucket_index] += value
+        timestamp = int(record.get("time_unix_ns", 0))
+        server_spans = server_active_spans.get(_server_id_from_engine_id(engine_id))
+        if server_spans and not _timestamp_in_spans(timestamp, server_spans):
+            continue
+        raw_series.setdefault((engine_id, output_name), []).append((timestamp, value))
 
-    for (engine_id, output_name), buckets in sorted(series.items()):
+    for (engine_id, output_name), samples in sorted(raw_series.items()):
+        sample_timestamps = _counter_sample_timestamps_for_engine(
+            engine_id, server_active_spans, trace_bounds, sample_interval_ns
+        )
+        if not sample_timestamps:
+            continue
+        buckets = [0.0] * len(sample_timestamps)
+        for timestamp, value in samples:
+            bucket_index = bisect_right(sample_timestamps, timestamp) - 1
+            bucket_index = max(0, min(bucket_index, len(buckets) - 1))
+            buckets[bucket_index] += value
         pid = _add_counter_metadata(events, process_ids, f"vllm_engine/{engine_id}")
-        for bucket_index, value in enumerate(buckets):
-            sample_ts = start_ns + bucket_index * sample_interval_ns
-            if sample_ts > end_ns:
-                sample_ts = end_ns
+        for sample_ts, value in zip(sample_timestamps, buckets):
             events.append(
                 {
                     "name": output_name,
@@ -428,8 +509,13 @@ def _add_selected_vllm_counter_events(
     trace_bounds: tuple[int, int] | None,
     sample_interval_ns: int,
 ) -> None:
-    _add_vllm_state_counter_events(events, process_ids, records, server_ids, trace_bounds, sample_interval_ns)
-    _add_vllm_bucket_sum_counter_events(events, process_ids, records, server_ids, trace_bounds, sample_interval_ns)
+    server_active_spans = _collect_server_active_spans(records, server_ids)
+    _add_vllm_state_counter_events(
+        events, process_ids, records, server_ids, server_active_spans, trace_bounds, sample_interval_ns
+    )
+    _add_vllm_bucket_sum_counter_events(
+        events, process_ids, records, server_ids, server_active_spans, trace_bounds, sample_interval_ns
+    )
 
 
 def records_to_active_counter_perfetto(

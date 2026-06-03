@@ -124,12 +124,51 @@ def _mean(values: list[float]) -> float:
     return float(sum(values) / len(values))
 
 
+class _RolloutPerfVLLMActivity:
+    """Process-local active rollout request tracker for engine counters."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active_request_ids: set[str] = set()
+
+    def start_request(self, request_id: str) -> None:
+        with self._lock:
+            self._active_request_ids.add(request_id)
+
+    def finish_request(self, request_id: str) -> bool:
+        with self._lock:
+            was_active = bool(self._active_request_ids)
+            self._active_request_ids.discard(request_id)
+            return was_active and not self._active_request_ids
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return bool(self._active_request_ids)
+
+
+_VLLM_ACTIVITY = _RolloutPerfVLLMActivity()
+_VLLM_METRIC_COLLECTORS_LOCK = threading.Lock()
+_VLLM_METRIC_COLLECTORS: list[Any] = []
+
+
+def _register_vllm_metric_collector(collector: Any) -> None:
+    with _VLLM_METRIC_COLLECTORS_LOCK:
+        _VLLM_METRIC_COLLECTORS.append(collector)
+
+
+def _emit_vllm_rollout_finished() -> None:
+    with _VLLM_METRIC_COLLECTORS_LOCK:
+        collectors = list(_VLLM_METRIC_COLLECTORS)
+    for collector in collectors:
+        collector.emit_rollout_finished()
+
+
 class RolloutPerfVLLMSampledMetrics:
     """Coalesce high-frequency vLLM StatLogger records into sampled counters."""
 
     STATE_COUNTERS = (
-        "vllm/scheduler/running_requests",
-        "vllm/scheduler/waiting_requests",
+        "vllm/scheduler/requests_running",
+        "vllm/scheduler/requests_waiting",
         "vllm/kv_cache/usage_ratio",
     )
     BUCKET_SUM_COUNTERS = (
@@ -150,6 +189,9 @@ class RolloutPerfVLLMSampledMetrics:
         self._bucket_sums: dict[str, float] = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
         self._has_bucket_data = False
         self._next_emit_monotonic_ns: int | None = None
+        self._seen_rollout_activity = False
+        self._emitted_idle_zero = True
+        _register_vllm_metric_collector(self)
 
     def record_scheduler(
         self,
@@ -159,12 +201,17 @@ class RolloutPerfVLLMSampledMetrics:
         kv_cache_usage_ratio: Optional[float],
         payload: dict[str, Any],
     ) -> None:
+        if not _VLLM_ACTIVITY.is_active():
+            self.discard_idle_sample()
+            return
         with self._lock:
+            self._seen_rollout_activity = True
+            self._emitted_idle_zero = False
             self._set_next_emit_if_needed()
             if running_requests is not None:
-                self._latest_state["vllm/scheduler/running_requests"] = float(running_requests)
+                self._latest_state["vllm/scheduler/requests_running"] = float(running_requests)
             if waiting_requests is not None:
-                self._latest_state["vllm/scheduler/waiting_requests"] = float(waiting_requests)
+                self._latest_state["vllm/scheduler/requests_waiting"] = float(waiting_requests)
             if kv_cache_usage_ratio is not None:
                 # Keep the peak usage observed in the sampling window. A max is more useful
                 # than the last value for spotting short cache pressure spikes.
@@ -183,7 +230,12 @@ class RolloutPerfVLLMSampledMetrics:
         batch_tokens_total: int,
         payload: dict[str, Any],
     ) -> None:
+        if not _VLLM_ACTIVITY.is_active():
+            self.discard_idle_sample()
+            return
         with self._lock:
+            self._seen_rollout_activity = True
+            self._emitted_idle_zero = False
             self._set_next_emit_if_needed()
             updates = {
                 "vllm/iteration/prefill_requests": prefill_requests,
@@ -202,6 +254,23 @@ class RolloutPerfVLLMSampledMetrics:
         with self._lock:
             self._emit_locked(payload)
 
+    def discard_idle_sample(self) -> None:
+        with self._lock:
+            if self._emitted_idle_zero:
+                self._reset_locked()
+
+    def emit_rollout_finished(self) -> None:
+        with self._lock:
+            if self._has_bucket_data:
+                self._emit_bucket_sums_locked(self._base_payload({}))
+            if self._seen_rollout_activity and not self._emitted_idle_zero:
+                payload = self._base_payload({})
+                for name in self.STATE_COUNTERS:
+                    emit_unsampled_counter(name, 0.0, payload, context=payload)
+                self._emitted_idle_zero = True
+            self._reset_locked()
+            self._seen_rollout_activity = False
+
     def _set_next_emit_if_needed(self) -> None:
         if self._next_emit_monotonic_ns is None:
             self._next_emit_monotonic_ns = time.monotonic_ns() + self.sample_interval_ns
@@ -216,19 +285,33 @@ class RolloutPerfVLLMSampledMetrics:
         # stale data does not create a burst of backfilled samples.
         self._next_emit_monotonic_ns = time.monotonic_ns() + self.sample_interval_ns
 
-    def _emit_locked(self, payload: dict[str, Any]) -> None:
-        sample_payload = dict(payload)
+    def _base_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        sample_payload = dict(self.context)
+        sample_payload.update(payload)
         sample_payload["sample_interval_ms"] = self.sample_interval_ms
+        return sample_payload
+
+    def _emit_locked(self, payload: dict[str, Any]) -> None:
+        sample_payload = self._base_payload(payload)
         for name in self.STATE_COUNTERS:
             if name in self._latest_state:
                 emit_unsampled_counter(name, self._latest_state[name], sample_payload, context=sample_payload)
         if self._has_bucket_data:
-            for name in self.BUCKET_SUM_COUNTERS:
-                emit_unsampled_counter(name, self._bucket_sums.get(name, 0.0), sample_payload, context=sample_payload)
-            self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
-            self._has_bucket_data = False
+            self._emit_bucket_sums_locked(sample_payload)
         # kv_cache usage is max-over-window, so reset it after each emitted window.
         self._latest_state.pop("vllm/kv_cache/usage_ratio", None)
+
+    def _emit_bucket_sums_locked(self, payload: dict[str, Any]) -> None:
+        for name in self.BUCKET_SUM_COUNTERS:
+            emit_unsampled_counter(name, self._bucket_sums.get(name, 0.0), payload, context=payload)
+        self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
+        self._has_bucket_data = False
+
+    def _reset_locked(self) -> None:
+        self._latest_state.clear()
+        self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
+        self._has_bucket_data = False
+        self._next_emit_monotonic_ns = None
 
 
 class RolloutPerfRequestKVMetricsSampler:
@@ -261,6 +344,7 @@ class RolloutPerfRequestKVMetricsSampler:
             self.block_size = value
 
     def start_request(self, request_id: str, prompt_token_count: int) -> None:
+        _VLLM_ACTIVITY.start_request(request_id)
         prompt_length = max(0, int(prompt_token_count or 0))
         with self._lock:
             self._prompt_lengths[request_id] = prompt_length
@@ -282,6 +366,8 @@ class RolloutPerfRequestKVMetricsSampler:
             emit_zero = not self._logical_lengths and self._last_emit_had_active
         if emit_zero:
             self._emit_snapshot(force=True)
+        if _VLLM_ACTIVITY.finish_request(request_id):
+            _emit_vllm_rollout_finished()
 
     def close(self) -> None:
         self._closed = True
@@ -452,8 +538,8 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
             "scheduler_stats": scheduler_stats is not None,
             "iteration_stats": iteration_stats is not None,
             "mm_cache_stats": mm_cache_stats is not None,
-            "running_requests": _getattr(scheduler_stats, "num_running_reqs", None) is not None,
-            "waiting_requests": _getattr(scheduler_stats, "num_waiting_reqs", None) is not None,
+            "requests_running": _getattr(scheduler_stats, "num_running_reqs", None) is not None,
+            "requests_waiting": _getattr(scheduler_stats, "num_waiting_reqs", None) is not None,
             "kv_cache_usage_ratio": _getattr(scheduler_stats, "kv_cache_usage", None) is not None,
             "kv_blocks_total": self.num_gpu_blocks is not None,
             "prefill_token_stats": prompt_stats is not None,
