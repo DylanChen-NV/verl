@@ -40,7 +40,7 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.rollout_perf import init_rollout_perf, push_trace_context, start_span
-from verl.utils.rollout_perf.vllm_metrics import RolloutPerfVLLMStatLogger
+from verl.utils.rollout_perf.vllm_metrics import RolloutPerfRequestKVMetricsSampler, RolloutPerfVLLMStatLogger
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -156,7 +156,22 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        os.environ["VERL_ROLLOUT_PERF_ENGINE_INTERNAL_SAMPLE_INTERVAL_MS"] = str(
+            self.config.perf_trace.engine_internal.sample_interval_ms
+        )
         init_rollout_perf(self.config.perf_trace, role="vllm_server")
+        self._rollout_perf_kv_sampler: RolloutPerfRequestKVMetricsSampler | None = None
+        if self.config.perf_trace.engine_internal.enable:
+            self._rollout_perf_kv_sampler = RolloutPerfRequestKVMetricsSampler(
+                context={
+                    "engine_backend": "vllm",
+                    "engine_index": 0,
+                    "replica_rank": replica_rank,
+                    "node_rank": node_rank,
+                    "vllm_version": vllm.__version__,
+                },
+                sample_interval_ms=self.config.perf_trace.engine_internal.sample_interval_ms,
+            )
         if self.config.perf_trace.engine_internal.enable and self.config.disable_log_stats:
             logger.warning(
                 "rollout perf trace engine_internal is enabled, but rollout.disable_log_stats=True; "
@@ -426,6 +441,12 @@ class vLLMHttpServer:
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        if self._rollout_perf_kv_sampler is not None:
+            cache_config = getattr(vllm_config, "cache_config", None)
+            block_size = getattr(cache_config, "block_size", None)
+            if block_size is None and hasattr(cache_config, "get"):
+                block_size = cache_config.get("block_size", None)
+            self._rollout_perf_kv_sampler.set_block_size(block_size)
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -577,6 +598,8 @@ class vLLMHttpServer:
             sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
             sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
             prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+            if self._rollout_perf_kv_sampler is not None:
+                self._rollout_perf_kv_sampler.start_request(request_id, len(prompt_ids))
             multi_modal_data = {}
             if image_data is not None:
                 multi_modal_data["image"] = image_data
@@ -619,6 +642,8 @@ class vLLMHttpServer:
                 if first_output_monotonic_ns is None:
                     first_output_unix_ns = time.time_ns()
                     first_output_monotonic_ns = time.monotonic_ns()
+                if self._rollout_perf_kv_sampler is not None and output.outputs:
+                    self._rollout_perf_kv_sampler.update_request(request_id, len(output.outputs[0].token_ids))
                 final_res = output
             assert final_res is not None
 
@@ -707,6 +732,8 @@ class vLLMHttpServer:
             span_error = e
             raise
         finally:
+            if self._rollout_perf_kv_sampler is not None:
+                self._rollout_perf_kv_sampler.finish_request(request_id)
             engine_span.finish(span_payload, status=span_status, error=span_error)
             perf_context.__exit__(None, None, None)
     async def wake_up(self, tags: list[str] | None = None):

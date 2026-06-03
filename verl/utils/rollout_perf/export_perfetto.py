@@ -31,6 +31,10 @@ VLLM_STATE_COUNTERS = {
     "vllm/scheduler/running_requests": ("vllm/running_requests", 1.0),
     "vllm/scheduler/waiting_requests": ("vllm/waiting_requests", 1.0),
     "vllm/kv_cache/usage_ratio": ("vllm/kv_cache_usage_%", 100.0),
+    "vllm/kv_len_logical_avg": ("vllm/kv_len_logical_avg", 1.0),
+    "vllm/kv_len_logical_p95": ("vllm/kv_len_logical_p95", 1.0),
+    "vllm/kv_len_alloc_est_avg": ("vllm/kv_len_alloc_est_avg", 1.0),
+    "vllm/kv_len_alloc_est_p95": ("vllm/kv_len_alloc_est_p95", 1.0),
 }
 
 VLLM_BUCKET_SUM_COUNTERS = {

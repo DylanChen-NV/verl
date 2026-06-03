@@ -357,8 +357,8 @@ perf_trace:
     # auto, vllm, sglang, trtllm.
     backend: auto
 
-    # Sampling interval for future periodic engine counters.
-    sample_interval_ms: 100
+    # Sampling interval for periodic engine counters.
+    sample_interval_ms: 500
 
 # rollout skip config (load/dump rollout data)
 skip:

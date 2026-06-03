@@ -19,7 +19,10 @@ SchedulerStats/IterationStats as unstable, so this module uses defensive
 attribute access and silently skips fields that are unavailable.
 """
 
+import math
 import os
+import threading
+import time
 from typing import Any, Optional
 
 from verl.utils.rollout_perf.collector import emit_unsampled_counter, emit_unsampled_event, init_rollout_perf
@@ -98,6 +101,214 @@ def _config_get(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default)
 
 
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        result = int(value)
+    except Exception:
+        result = default
+    return result if result > 0 else default
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(math.ceil((percentile / 100.0) * len(ordered))) - 1
+    index = max(0, min(index, len(ordered) - 1))
+    return float(ordered[index])
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+class RolloutPerfVLLMSampledMetrics:
+    """Coalesce high-frequency vLLM StatLogger records into sampled counters."""
+
+    STATE_COUNTERS = (
+        "vllm/scheduler/running_requests",
+        "vllm/scheduler/waiting_requests",
+        "vllm/kv_cache/usage_ratio",
+    )
+    BUCKET_SUM_COUNTERS = (
+        "vllm/iteration/prefill_requests",
+        "vllm/iteration/decode_requests",
+        "vllm/iteration/batch_requests_total",
+        "vllm/iteration/prefill_tokens_computed",
+        "vllm/iteration/decode_tokens",
+        "vllm/iteration/batch_tokens_total",
+    )
+
+    def __init__(self, context: dict[str, Any], sample_interval_ms: int):
+        self.context = dict(context)
+        self.sample_interval_ms = _positive_int(sample_interval_ms, 500)
+        self.sample_interval_ns = self.sample_interval_ms * 1_000_000
+        self._lock = threading.Lock()
+        self._latest_state: dict[str, float] = {}
+        self._bucket_sums: dict[str, float] = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
+        self._has_bucket_data = False
+        self._next_emit_monotonic_ns: int | None = None
+
+    def record_scheduler(
+        self,
+        *,
+        running_requests: Optional[int],
+        waiting_requests: Optional[int],
+        kv_cache_usage_ratio: Optional[float],
+        payload: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._set_next_emit_if_needed()
+            if running_requests is not None:
+                self._latest_state["vllm/scheduler/running_requests"] = float(running_requests)
+            if waiting_requests is not None:
+                self._latest_state["vllm/scheduler/waiting_requests"] = float(waiting_requests)
+            if kv_cache_usage_ratio is not None:
+                # Keep the peak usage observed in the sampling window. A max is more useful
+                # than the last value for spotting short cache pressure spikes.
+                key = "vllm/kv_cache/usage_ratio"
+                self._latest_state[key] = max(float(kv_cache_usage_ratio), self._latest_state.get(key, 0.0))
+            self._emit_due_locked(payload)
+
+    def record_iteration(
+        self,
+        *,
+        prefill_requests: int,
+        decode_requests: int,
+        batch_requests_total: int,
+        prefill_tokens_computed: int,
+        decode_tokens: int,
+        batch_tokens_total: int,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._set_next_emit_if_needed()
+            updates = {
+                "vllm/iteration/prefill_requests": prefill_requests,
+                "vllm/iteration/decode_requests": decode_requests,
+                "vllm/iteration/batch_requests_total": batch_requests_total,
+                "vllm/iteration/prefill_tokens_computed": prefill_tokens_computed,
+                "vllm/iteration/decode_tokens": decode_tokens,
+                "vllm/iteration/batch_tokens_total": batch_tokens_total,
+            }
+            for name, value in updates.items():
+                self._bucket_sums[name] += float(value or 0)
+            self._has_bucket_data = True
+            self._emit_due_locked(payload)
+
+    def flush(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._emit_locked(payload)
+
+    def _set_next_emit_if_needed(self) -> None:
+        if self._next_emit_monotonic_ns is None:
+            self._next_emit_monotonic_ns = time.monotonic_ns() + self.sample_interval_ns
+
+    def _emit_due_locked(self, payload: dict[str, Any]) -> None:
+        if self._next_emit_monotonic_ns is None:
+            return
+        if time.monotonic_ns() < self._next_emit_monotonic_ns:
+            return
+        self._emit_locked(payload)
+        # If vLLM callbacks were delayed beyond one interval, advance from now so
+        # stale data does not create a burst of backfilled samples.
+        self._next_emit_monotonic_ns = time.monotonic_ns() + self.sample_interval_ns
+
+    def _emit_locked(self, payload: dict[str, Any]) -> None:
+        sample_payload = dict(payload)
+        sample_payload["sample_interval_ms"] = self.sample_interval_ms
+        for name in self.STATE_COUNTERS:
+            if name in self._latest_state:
+                emit_unsampled_counter(name, self._latest_state[name], sample_payload, context=sample_payload)
+        if self._has_bucket_data:
+            for name in self.BUCKET_SUM_COUNTERS:
+                emit_unsampled_counter(name, self._bucket_sums.get(name, 0.0), sample_payload, context=sample_payload)
+            self._bucket_sums = {name: 0.0 for name in self.BUCKET_SUM_COUNTERS}
+            self._has_bucket_data = False
+        # kv_cache usage is max-over-window, so reset it after each emitted window.
+        self._latest_state.pop("vllm/kv_cache/usage_ratio", None)
+
+
+class RolloutPerfRequestKVMetricsSampler:
+    """Sample active request KV lengths from server-side request progress."""
+
+    LOGICAL_AVG = "vllm/kv_len_logical_avg"
+    LOGICAL_P95 = "vllm/kv_len_logical_p95"
+    ALLOC_EST_AVG = "vllm/kv_len_alloc_est_avg"
+    ALLOC_EST_P95 = "vllm/kv_len_alloc_est_p95"
+
+    def __init__(self, *, context: dict[str, Any], sample_interval_ms: int, block_size: Optional[int] = None):
+        self.context = dict(context)
+        self.sample_interval_ms = _positive_int(sample_interval_ms, 500)
+        self.block_size = _positive_int(block_size, 16)
+        self._interval_s = self.sample_interval_ms / 1000.0
+        self._lock = threading.Lock()
+        self._prompt_lengths: dict[str, int] = {}
+        self._logical_lengths: dict[str, int] = {}
+        self._last_emit_had_active = False
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="rollout-perf-vllm-kv-sampler", daemon=True)
+        self._thread.start()
+        payload = dict(self.context)
+        payload.update({"sample_interval_ms": self.sample_interval_ms, "block_size": self.block_size})
+        emit_unsampled_event("vllm_request_kv_sampler_started", payload, context=payload)
+
+    def set_block_size(self, block_size: Any) -> None:
+        value = _positive_int(block_size, self.block_size)
+        with self._lock:
+            self.block_size = value
+
+    def start_request(self, request_id: str, prompt_token_count: int) -> None:
+        prompt_length = max(0, int(prompt_token_count or 0))
+        with self._lock:
+            self._prompt_lengths[request_id] = prompt_length
+            self._logical_lengths[request_id] = prompt_length
+
+    def update_request(self, request_id: str, cumulative_decoded_tokens: int) -> None:
+        decoded = max(0, int(cumulative_decoded_tokens or 0))
+        with self._lock:
+            prompt_length = self._prompt_lengths.get(request_id)
+            if prompt_length is None:
+                return
+            self._logical_lengths[request_id] = prompt_length + decoded
+
+    def finish_request(self, request_id: str) -> None:
+        emit_zero = False
+        with self._lock:
+            self._prompt_lengths.pop(request_id, None)
+            self._logical_lengths.pop(request_id, None)
+            emit_zero = not self._logical_lengths and self._last_emit_had_active
+        if emit_zero:
+            self._emit_snapshot(force=True)
+
+    def close(self) -> None:
+        self._closed = True
+        self._emit_snapshot(force=True)
+
+    def _run(self) -> None:
+        while not self._closed:
+            time.sleep(self._interval_s)
+            self._emit_snapshot()
+
+    def _emit_snapshot(self, *, force: bool = False) -> None:
+        with self._lock:
+            logical_lengths = [float(value) for value in self._logical_lengths.values()]
+            block_size = self.block_size
+            should_emit = force or bool(logical_lengths) or self._last_emit_had_active
+            if not should_emit:
+                return
+            self._last_emit_had_active = bool(logical_lengths)
+        allocated_lengths = [float(int(math.ceil(value / block_size) * block_size)) for value in logical_lengths]
+        payload = dict(self.context)
+        payload.update({"sample_interval_ms": self.sample_interval_ms, "block_size": block_size})
+        emit_unsampled_counter(self.LOGICAL_AVG, _mean(logical_lengths), payload, context=payload)
+        emit_unsampled_counter(self.LOGICAL_P95, _nearest_rank_percentile(logical_lengths, 95.0), payload, context=payload)
+        emit_unsampled_counter(self.ALLOC_EST_AVG, _mean(allocated_lengths), payload, context=payload)
+        emit_unsampled_counter(self.ALLOC_EST_P95, _nearest_rank_percentile(allocated_lengths, 95.0), payload, context=payload)
+
+
 class RolloutPerfVLLMStatLogger(StatLoggerBase):
     """Custom vLLM stat logger that writes engine-level rollout perf counters."""
 
@@ -109,6 +320,9 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
         self.engine_index = engine_index
         self._capability_reported = False
         self._last_sleep_state: tuple[int, int] | None = None
+        self.sample_interval_ms = _positive_int(
+            os.getenv("VERL_ROLLOUT_PERF_ENGINE_INTERNAL_SAMPLE_INTERVAL_MS"), 500
+        )
 
         output_dir = os.getenv("VERL_ROLLOUT_PERF_OUTPUT_DIR")
         flush_interval_s = float(os.getenv("VERL_ROLLOUT_PERF_FLUSH_INTERVAL_S", "5.0"))
@@ -136,6 +350,7 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
             "node_rank": os.getenv("VERL_NODE_RANK"),
             "vllm_version": getattr(vllm, "__version__", None) if vllm is not None else None,
         }
+        self._sampled_metrics = RolloutPerfVLLMSampledMetrics(self.context, self.sample_interval_ms)
 
     def log_engine_initialized(self):
         emit_unsampled_event(
@@ -146,6 +361,7 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
                 "block_size": self.block_size,
                 "max_num_batched_tokens": self.max_num_batched_tokens,
                 "max_num_seqs": self.max_num_seqs,
+                "sample_interval_ms": self.sample_interval_ms,
                 "stat_logger_interface": "vllm.v1.metrics.loggers.StatLoggerBase",
             },
             context=self.context,
@@ -191,35 +407,18 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
     def _record_scheduler_stats(self, stats: Any, payload: dict[str, Any]):
         running = _as_int(_getattr(stats, "num_running_reqs", None))
         waiting = _as_int(_getattr(stats, "num_waiting_reqs", None))
-        skipped_waiting = _as_int(_getattr(stats, "num_skipped_waiting_reqs", None))
         kv_usage = _as_number(_getattr(stats, "kv_cache_usage", None))
-
-        self._emit_counter("vllm/scheduler/running_requests", running, payload)
-        self._emit_counter("vllm/scheduler/waiting_requests", waiting, payload)
-        self._emit_counter("vllm/scheduler/skipped_waiting_requests", skipped_waiting, payload)
-        if waiting is not None or skipped_waiting is not None:
-            self._emit_counter("vllm/scheduler/waiting_requests_total", (waiting or 0) + (skipped_waiting or 0), payload)
-        self._emit_counter("vllm/kv_cache/usage_ratio", kv_usage, payload)
-
-        if kv_usage is not None and self.num_gpu_blocks is not None:
-            used_blocks = int(round(kv_usage * self.num_gpu_blocks))
-            self._emit_counter("vllm/kv_cache/blocks_total", self.num_gpu_blocks, payload)
-            self._emit_counter("vllm/kv_cache/blocks_used", used_blocks, payload)
-            self._emit_counter("vllm/kv_cache/blocks_free", max(self.num_gpu_blocks - used_blocks, 0), payload)
-
-        prefix_rate = _hit_rate(_getattr(stats, "prefix_cache_stats", None))
-        self._emit_counter("vllm/prefix_cache/hit_rate", prefix_rate, payload)
-
-        spec_stats = _getattr(stats, "spec_decoding_stats", None)
-        if spec_stats is not None:
-            self._emit_counter("vllm/spec_decode/accepted_tokens", _getattr(spec_stats, "num_accepted_tokens", None), payload)
-            self._emit_counter("vllm/spec_decode/draft_tokens", _getattr(spec_stats, "num_draft_tokens", None), payload)
+        self._sampled_metrics.record_scheduler(
+            running_requests=running,
+            waiting_requests=waiting,
+            kv_cache_usage_ratio=kv_usage,
+            payload=payload,
+        )
 
     def _record_iteration_stats(self, stats: Any, payload: dict[str, Any]):
         prompt_stats = _getattr(stats, "prompt_token_stats", None)
         prefill_tokens_total = _as_int(_getattr(prompt_stats, "total", None))
         prefill_tokens_computed = _as_int(_getattr(prompt_stats, "computed", None))
-        prefill_tokens_cached = _as_int(_getattr(prompt_stats, "cached_tokens", None))
         if prefill_tokens_total is None:
             prefill_tokens_total = _as_int(_getattr(stats, "num_prompt_tokens", None))
 
@@ -227,24 +426,20 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
         decode_requests = _safe_len(_getattr(stats, "inter_token_latencies_iter", None)) or 0
         generation_tokens = _as_int(_getattr(stats, "num_generation_tokens", None)) or 0
         decode_tokens = max(generation_tokens - prefill_requests, 0)
-        preempted_requests = _as_int(_getattr(stats, "num_preempted_reqs", None))
 
         computed_prefill = prefill_tokens_computed if prefill_tokens_computed is not None else (prefill_tokens_total or 0)
         batch_tokens_total = computed_prefill + decode_tokens
         batch_requests_total = prefill_requests + decode_requests
 
-        self._emit_counter("vllm/iteration/prefill_requests", prefill_requests, payload)
-        self._emit_counter("vllm/iteration/decode_requests", decode_requests, payload)
-        self._emit_counter("vllm/iteration/batch_requests_total", batch_requests_total, payload)
-        self._emit_counter("vllm/iteration/prefill_tokens_total", prefill_tokens_total, payload)
-        self._emit_counter("vllm/iteration/prefill_tokens_computed", prefill_tokens_computed, payload)
-        self._emit_counter("vllm/iteration/prefill_tokens_cached", prefill_tokens_cached, payload)
-        self._emit_counter("vllm/iteration/decode_tokens", decode_tokens, payload)
-        self._emit_counter("vllm/iteration/batch_tokens_total", batch_tokens_total, payload)
-        self._emit_counter("vllm/iteration/preempted_requests", preempted_requests, payload)
-
-        self._emit_counter("vllm/iteration/prefill_tokens_local_cache_hit", _getattr(prompt_stats, "local_cache_hit", None), payload)
-        self._emit_counter("vllm/iteration/prefill_tokens_external_kv", _getattr(prompt_stats, "external_kv_transfer", None), payload)
+        self._sampled_metrics.record_iteration(
+            prefill_requests=prefill_requests,
+            decode_requests=decode_requests,
+            batch_requests_total=batch_requests_total,
+            prefill_tokens_computed=computed_prefill,
+            decode_tokens=decode_tokens,
+            batch_tokens_total=batch_tokens_total,
+            payload=payload,
+        )
 
     def _record_mm_cache_stats(self, stats: Any, payload: dict[str, Any]):
         self._emit_counter("vllm/mm_cache/hit_rate", _hit_rate(stats), payload)
@@ -267,21 +462,15 @@ class RolloutPerfVLLMStatLogger(StatLoggerBase):
             "decode_requests": _getattr(iteration_stats, "inter_token_latencies_iter", None) is not None,
             "preempted_requests": _getattr(iteration_stats, "num_preempted_reqs", None) is not None,
         }
-        missing_or_deferred = [
-            "kv_cache_len_avg",
-            "kv_cache_len_p50",
-            "kv_cache_len_p95",
-            "kv_cache_len_max",
-            "per_request_active_kv_lengths",
-        ]
+        missing_or_deferred = []
         emit_unsampled_event(
             "vllm_engine_internal_metrics_capability",
             {
                 "available": available,
                 "missing_or_deferred": missing_or_deferred,
                 "notes": (
-                    "Metrics come from vLLM StatLogger SchedulerStats/IterationStats. "
-                    "KV length distribution is deferred because it is not exposed by this interface."
+                    "Scheduler and iteration metrics come from vLLM StatLogger and are sampled in-process. "
+                    "KV length avg/p95 metrics are sampled from server-side request progress."
                 ),
             },
             context=payload,

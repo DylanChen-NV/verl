@@ -23,7 +23,7 @@ class PerfTraceEngineInternalConfig(BaseConfig):
 
     enable: bool = False
     backend: str = "auto"
-    sample_interval_ms: int = 100
+    sample_interval_ms: int = 500
 
 
 @dataclass
