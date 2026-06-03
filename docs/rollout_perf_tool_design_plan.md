@@ -377,3 +377,58 @@ P2 分析从 raw trace 离线计算，不阻塞 P0 可视化。
 - exact output length replay 的控制方式需要针对 vLLM/SGLang/TRT-LLM 分别确认。
 - 是否需要采集 prompt/tool 原文内容应保持默认关闭，只在明确需要 debug 时打开。
 
+## P0 Implementation Status - vLLM KV Length Sampling
+
+Validated on DFW with ReTool 2 nodes x 8 H100:
+
+```text
+run_id=exp_rollout_perf_kvlen_retool_2n8g_20260603_100ms
+slurm_job_id=12456997
+state=COMPLETED
+verl_commit=86338a0c46968431d872617f038c46ece0103f28
+image=verlai/verl:vllm020.dev1
+vllm_version=0.20.2
+sample_interval_default_ms=500
+sample_interval_validation_ms=100
+wandb_url=https://wandb.ai/czqing422-sjtu/verl-fully-async-smoke/runs/retool-vllm020-2n8g-12456997
+```
+
+Implemented P0 pieces:
+
+```text
+raw JSONL rollout trace writer and sampled spans/counters
+Perfetto full trace export
+Perfetto focused active-counter export
+agent_loop_worker active counters
+vllm_server active request counters
+vLLM StatLogger scheduler/iteration sampled counters
+vLLM request logical/allocated KV length avg/p95 sampled counters
+```
+
+Sampling semantics:
+
+```text
+Default engine_internal.sample_interval_ms is 500.
+Small validation runs can override to 100 through Hydra.
+Scheduler state counters use latest value per window, except kv_cache_usage_ratio uses max per window.
+Iteration counters are bucket sums per window.
+Request KV length counters are sampled by a background server-side sampler over active requests.
+logical_kv_len = prompt tokens + cumulative decoded tokens.
+allocated_est_kv_len = ceil(logical_kv_len / block_size) * block_size.
+Perfetto focused counter args contain only value; metadata remains in raw JSONL.
+```
+
+Remaining P0/P1 work:
+
+```text
+Add equivalent engine adapter contracts for SGLang/TRT-LLM without changing the raw trace schema.
+Add richer vLLM per-iteration prefill/decode timeline slices if public hooks expose stable timestamps.
+Add step_summary.jsonl and low-cardinality W&B artifact/path logging.
+Start P1 closed-loop replay after P0 visualization is stable.
+```
+
+Detailed runbook:
+
+```text
+/home/scratch.ziqingc_gpu/06_codex_projects/06_verl/00_basic/exp_rollout_perf_trace_retool_vllm020_smoke/RUNBOOK.md
+```
