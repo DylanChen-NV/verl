@@ -11,14 +11,17 @@ from pathlib import Path
 from typing import Any
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "engines"))
+    current_file = Path(__file__).resolve()
+    sys.path.insert(0, str(current_file.parents[4]))
+    sys.path.insert(0, str(current_file.parent))
     from engines.mock import MockReplayEngine
+    from engines.vllm import VLLMReplayEngine
     from replay_writer import ReplaySpan, ReplayTraceWriter
     from schema import ReplayPlan, ReplayToolCall, ReplayTrajectory, ReplayTurn
     from tool_mock import ToolSleepMock
 else:
     from .engines.mock import MockReplayEngine
+    from .engines.vllm import VLLMReplayEngine
     from .replay_writer import ReplaySpan, ReplayTraceWriter
     from .schema import ReplayPlan, ReplayToolCall, ReplayTrajectory, ReplayTurn
     from .tool_mock import ToolSleepMock
@@ -92,7 +95,7 @@ async def _run_tool_call(
 
 async def _run_turn(
     writer: ReplayTraceWriter,
-    engine: MockReplayEngine,
+    engine: Any,
     tool_mock: ToolSleepMock,
     trajectory: ReplayTrajectory,
     turn: ReplayTurn,
@@ -122,8 +125,9 @@ async def _run_turn(
             "requested_max_tokens": llm_request.requested_max_tokens,
         },
     )
+    engine_backend = getattr(engine, "backend_name", "mock")
     engine_context = dict(llm_context)
-    engine_context.update({"engine_backend": "mock", "engine_request_id": llm_request.engine_request_id})
+    engine_context.update({"engine_backend": engine_backend, "engine_request_id": llm_request.engine_request_id})
     engine_span = ReplaySpan(
         writer,
         role="vllm_server",
@@ -133,7 +137,7 @@ async def _run_turn(
             "engine_request_id": llm_request.engine_request_id,
             "prompt_token_count": llm_request.prompt_token_count,
             "target_output_token_count": llm_request.output_token_count,
-            "replay_engine": "mock",
+            "replay_engine": engine_backend,
         },
     )
     try:
@@ -194,7 +198,7 @@ async def _run_turn(
 
 async def _run_trajectory(
     writer: ReplayTraceWriter,
-    engine: MockReplayEngine,
+    engine: Any,
     tool_mock: ToolSleepMock,
     trajectory: ReplayTrajectory,
     *,
@@ -244,11 +248,36 @@ async def run_replay(
     max_concurrency: int | None = None,
     fixed_mock_latency_ms: float | None = None,
     run_id: str | None = None,
+    model: str | None = None,
+    tensor_parallel_size: int = 1,
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float = 0.90,
+    vllm_batch_wait_ms: float = 5.0,
+    vllm_max_batch_size: int = 32,
+    vllm_sample_interval_ms: int = 100,
+    trust_remote_code: bool = True,
+    enforce_eager: bool = False,
 ) -> dict[str, Any]:
-    if engine_name != "mock":
-        raise ValueError("V0 P1 runner currently supports only --engine mock.")
     writer = ReplayTraceWriter(output_dir, run_id=run_id)
-    engine = MockReplayEngine(time_scale=time_scale, fixed_latency_ms=fixed_mock_latency_ms)
+    if engine_name == "mock":
+        engine = MockReplayEngine(time_scale=time_scale, fixed_latency_ms=fixed_mock_latency_ms)
+    elif engine_name == "vllm":
+        if not model:
+            raise ValueError("--model is required for --engine vllm")
+        engine = VLLMReplayEngine(
+            model=model,
+            output_dir=output_dir,
+            tensor_parallel_size=tensor_parallel_size,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+            batch_wait_ms=vllm_batch_wait_ms,
+            max_batch_size=vllm_max_batch_size,
+            sample_interval_ms=vllm_sample_interval_ms,
+            trust_remote_code=trust_remote_code,
+            enforce_eager=enforce_eager,
+        )
+    else:
+        raise ValueError(f"Unsupported replay engine: {engine_name}")
     tool_mock = ToolSleepMock(time_scale=time_scale)
     trajectories = plan.trajectories[:max_trajectories] if max_trajectories is not None else plan.trajectories
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency and max_concurrency > 0 else None
@@ -263,6 +292,11 @@ async def run_replay(
     try:
         await asyncio.gather(*(run_one(trajectory) for trajectory in trajectories))
     finally:
+        close = getattr(engine, "close", None)
+        if close is not None:
+            close_result = close()
+            if asyncio.iscoroutine(close_result):
+                await close_result
         writer.close()
 
     return {
@@ -278,7 +312,7 @@ async def run_replay(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run closed-loop replay from a replay plan.")
     parser.add_argument("--plan", required=True, help="Replay plan JSON path.")
-    parser.add_argument("--engine", choices=("mock",), default="mock", help="Replay engine.")
+    parser.add_argument("--engine", choices=("mock", "vllm"), default="mock", help="Replay engine.")
     parser.add_argument("--output-dir", required=True, help="Output raw replay trace directory.")
     parser.add_argument("--arrival-mode", choices=("original", "burst"), default="original")
     parser.add_argument("--time-scale", type=float, default=1.0, help="Scale original sleeps and arrival offsets.")
@@ -286,6 +320,15 @@ def main() -> None:
     parser.add_argument("--max-concurrency", type=int, default=None)
     parser.add_argument("--fixed-mock-latency-ms", type=float, default=None)
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--model", default=None, help="Model path for --engine vllm.")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--vllm-batch-wait-ms", type=float, default=5.0)
+    parser.add_argument("--vllm-max-batch-size", type=int, default=32)
+    parser.add_argument("--vllm-sample-interval-ms", type=int, default=100)
+    parser.add_argument("--no-trust-remote-code", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
 
     plan = _load_plan(args.plan)
@@ -300,6 +343,15 @@ def main() -> None:
             max_concurrency=args.max_concurrency,
             fixed_mock_latency_ms=args.fixed_mock_latency_ms,
             run_id=args.run_id,
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            vllm_batch_wait_ms=args.vllm_batch_wait_ms,
+            vllm_max_batch_size=args.vllm_max_batch_size,
+            vllm_sample_interval_ms=args.vllm_sample_interval_ms,
+            trust_remote_code=not args.no_trust_remote_code,
+            enforce_eager=args.enforce_eager,
         )
     )
     print(json.dumps(summary, sort_keys=True))

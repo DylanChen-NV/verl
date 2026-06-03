@@ -203,6 +203,12 @@ class RolloutPerfVLLMSampledMetrics:
         self._next_emit_monotonic_ns: int | None = None
         self._seen_rollout_activity = False
         self._emitted_idle_zero = True
+        self.force_active = os.getenv("VERL_ROLLOUT_PERF_FORCE_ENGINE_INTERNAL_ACTIVE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         _register_vllm_metric_collector(self)
 
     def record_scheduler(
@@ -213,7 +219,7 @@ class RolloutPerfVLLMSampledMetrics:
         kv_cache_usage_ratio: Optional[float],
         payload: dict[str, Any],
     ) -> None:
-        if not _VLLM_ACTIVITY.is_active():
+        if not self.force_active and not _VLLM_ACTIVITY.is_active():
             self.discard_idle_sample()
             return
         with self._lock:
@@ -247,7 +253,7 @@ class RolloutPerfVLLMSampledMetrics:
         batch_tokens_total: int,
         payload: dict[str, Any],
     ) -> None:
-        if not _VLLM_ACTIVITY.is_active():
+        if not self.force_active and not _VLLM_ACTIVITY.is_active():
             self.discard_idle_sample()
             return
         with self._lock:

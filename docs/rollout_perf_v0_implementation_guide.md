@@ -9,7 +9,7 @@ Related design documents:
 - `docs/rollout_perf_trace_schema_draft.md`
 
 The V0 implementation covered here is the P0 collection and Perfetto
-visualization path. Closed-loop replay is not implemented yet.
+visualization path. Closed-loop replay is implemented as P1 and documented in docs/rollout_perf_p1_closed_loop_replay_plan.md.
 
 ## Validated Baseline
 
