@@ -34,7 +34,7 @@ from omegaconf import DictConfig
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_op
 from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
 from verl.workers.rollout.utils import update_prometheus_config
 
@@ -52,6 +52,23 @@ def _verl_recompute_event(phase: str, **fields: Any) -> None:
         **fields,
     }
     print("VERL_RECOMPUTE_EVENT " + json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _set_mlflow_attempt_attributes(**attributes: Any) -> None:
+    if RolloutTraceConfig.get_backend() != "mlflow":
+        return
+    try:
+        import mlflow
+
+        span = mlflow.get_current_active_span()
+        if span is None:
+            return
+        for key, value in attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+    except Exception:
+        logger.warning("Failed to attach recompute attributes to MLflow span", exc_info=True)
+
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
@@ -266,6 +283,7 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        recompute_context: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -290,6 +308,11 @@ class LLMServerClient:
             lb_status=lb_status,
         )
         server_id, server = await self._acquire_server(request_id)
+        recompute_context = recompute_context or {}
+        span_attributes = dict(recompute_context)
+        span_attributes["verl.rollout.server_id"] = str(server_id)
+        span_attributes.setdefault("verl.flexkv.put_status", "disabled")
+        _set_mlflow_attempt_attributes(**span_attributes)
         _verl_recompute_event(
             "LB_AFTER_ACQUIRE",
             logical_request_id=str(request_id),
@@ -326,6 +349,17 @@ class LLMServerClient:
                 **kwargs,
             )
             global_steps = output.extra_fields.get("global_steps")
+            dynamic_cycle_id = recompute_context.get("verl.recompute.dynamic_cycle_id")
+            if output.stop_reason in ("aborted", "abort") and not dynamic_cycle_id:
+                dynamic_cycle_id = int(os.getenv("VERL_MONITOR_DYNAMIC_CYCLE_ID", "1"))
+            _set_mlflow_attempt_attributes(
+                **{
+                    "verl.recompute.dynamic_cycle_id": dynamic_cycle_id,
+                    "verl.recompute.policy_version": global_steps,
+                    "verl.recompute.partial_tokens_after_attempt": len(output.token_ids),
+                    "verl.recompute.stop_reason": output.stop_reason,
+                }
+            )
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
             _verl_recompute_event(
@@ -405,6 +439,19 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     retry_prefix_tokens=len(prompt_ids) + len(final_output.token_ids),
                 )
 
+            recompute_context = {
+                "verl.recompute.logical_request_id": str(request_id),
+                "verl.recompute.engine_request_id": str(engine_request_id),
+                "verl.recompute.attempt_id": attempt_id,
+                "verl.recompute.dynamic_cycle_id": (
+                    int(os.getenv("VERL_MONITOR_DYNAMIC_CYCLE_ID", "1")) if attempt_id > 0 else 0
+                ),
+                "verl.recompute.is_retry": attempt_id > 0,
+                "verl.recompute.partial_tokens": len(final_output.token_ids),
+                "verl.recompute.retry_prefix_tokens": len(prompt_ids) + len(final_output.token_ids),
+                "verl.flexkv.put_status": os.getenv("VERL_FLEXKV_PUT_STATUS", "disabled"),
+            }
+
             # 1. generate tokens
             output = await super().generate(
                 request_id=engine_request_id,
@@ -414,6 +461,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                recompute_context=recompute_context,
                 **kwargs,
             )
 

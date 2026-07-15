@@ -647,6 +647,15 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
         print(f"VERL_PIPELINE_EVENT phase=WORKER_GATHER_END pid={__import__('os').getpid()} outputs={len(outputs)}", flush=True)
+        if RolloutTraceConfig.get_backend() == "mlflow":
+            try:
+                flush_trace_async_logging = getattr(
+                    RolloutTraceConfig.get_client(), "flush_trace_async_logging", None
+                )
+                if flush_trace_async_logging is not None:
+                    flush_trace_async_logging()
+            except Exception:
+                logger.warning("Failed to flush MLflow rollout traces", exc_info=True)
 
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
