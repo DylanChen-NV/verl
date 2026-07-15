@@ -314,8 +314,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             DataProto: Output batch.
         """
         worker = self._select_best_worker()
+        print(f"VERL_PIPELINE_EVENT phase=MANAGER_RPC_BEGIN pid={__import__('os').getpid()}", flush=True)
         output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        output = await asyncio.wrap_future(output_future.future())
+        print(f"VERL_PIPELINE_EVENT phase=MANAGER_RPC_END pid={__import__('os').getpid()} batch={len(output)}", flush=True)
+        return output
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
@@ -996,7 +999,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
+        print(f"VERL_PIPELINE_EVENT phase=SAMPLE_GENERATE_BEGIN pid={__import__('os').getpid()} sample={rollout_sample.sample_id}", flush=True)
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        print(f"VERL_PIPELINE_EVENT phase=SAMPLE_GENERATE_END pid={__import__('os').getpid()} sample={rollout_sample.sample_id}", flush=True)
 
         rollout_sample.full_batch = ret
         # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
@@ -1005,9 +1010,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
         rollout_sample.rollout_status = await self.get_statistics()
 
+        print(f"VERL_PIPELINE_EVENT phase=QUEUE_PUT_BEGIN pid={__import__('os').getpid()} sample={rollout_sample.sample_id}", flush=True)
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
         )
+        print(f"VERL_PIPELINE_EVENT phase=QUEUE_PUT_END pid={__import__('os').getpid()} sample={rollout_sample.sample_id} success={success}", flush=True)
         if success:
             self.total_generated_samples += 1
             self._step_generated_samples += 1

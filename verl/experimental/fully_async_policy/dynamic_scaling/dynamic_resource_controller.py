@@ -26,6 +26,7 @@ Deactivate (order is critical):
   3. sleep_replicas   – release KV cache + offload weights, return GPU to training.
 """
 
+import json
 import time
 
 import ray
@@ -114,6 +115,30 @@ class DynamicResourceController:
         """Remove hybrid replicas from LB, abort in-flight requests, release GPU memory."""
         print(f"[DynamicResourceController] Deactivating hybrid replicas at step {global_steps}")
         start = time.time()
+        grace_s = float(__import__("os").getenv("VERL_RECOMPUTE_DEACTIVATE_GRACE_S", "0"))
+        if grace_s > 0:
+            print(
+                f"[DynamicResourceController] Waiting {grace_s:.2f}s before deactivation "
+                "to observe in-flight hybrid requests",
+                flush=True,
+            )
+            await __import__("asyncio").sleep(grace_s)
+        dynamic_cycle_id = self.deactivate_count + 1
+        if __import__("os").getenv("VERL_RECOMPUTE_TRACE", "0") == "1":
+            print(
+                "VERL_RECOMPUTE_EVENT "
+                + json.dumps(
+                    {
+                        "phase": "CYCLE_START",
+                        "dynamic_cycle_id": dynamic_cycle_id,
+                        "global_steps": global_steps,
+                        "monotonic_ns": time.monotonic_ns(),
+                        "wall_ns": time.time_ns(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
         hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
@@ -129,6 +154,21 @@ class DynamicResourceController:
 
         self._hybrid_active = False
         self.deactivate_count += 1
+        if __import__("os").getenv("VERL_RECOMPUTE_TRACE", "0") == "1":
+            print(
+                "VERL_RECOMPUTE_EVENT "
+                + json.dumps(
+                    {
+                        "phase": "CYCLE_END",
+                        "dynamic_cycle_id": dynamic_cycle_id,
+                        "global_steps": global_steps,
+                        "monotonic_ns": time.monotonic_ns(),
+                        "wall_ns": time.time_ns(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         print(
             f"[DynamicResourceController] Deactivated {len(hybrid_resource_ids)} replicas "
             f"in {time.time() - start:.2f}s (count={self.deactivate_count})"

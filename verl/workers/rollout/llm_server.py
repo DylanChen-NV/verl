@@ -19,8 +19,10 @@ Utility classes for manage and request LLM servers:
 """
 
 import asyncio
+import json
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -38,6 +40,18 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _verl_recompute_event(phase: str, **fields: Any) -> None:
+    if os.getenv("VERL_RECOMPUTE_TRACE", "0") != "1":
+        return
+    payload = {
+        "phase": phase,
+        "monotonic_ns": time.monotonic_ns(),
+        "wall_ns": time.time_ns(),
+        **fields,
+    }
+    print("VERL_RECOMPUTE_EVENT " + json.dumps(payload, sort_keys=True), flush=True)
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
@@ -264,7 +278,23 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        _verl_recompute_event(
+            "CLIENT_ENTER",
+            logical_request_id=str(request_id),
+            prompt_tokens=len(prompt_ids),
+        )
+        lb_status = await self._load_balancer.get_status.remote()
+        _verl_recompute_event(
+            "LB_BEFORE_ACQUIRE",
+            logical_request_id=str(request_id),
+            lb_status=lb_status,
+        )
         server_id, server = await self._acquire_server(request_id)
+        _verl_recompute_event(
+            "LB_AFTER_ACQUIRE",
+            logical_request_id=str(request_id),
+            server_id=str(server_id),
+        )
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -276,8 +306,17 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
+            _verl_recompute_event(
+                "SERVER_RPC_BEGIN",
+                logical_request_id=str(request_id),
+                server_id=str(server_id),
+            )
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=(
+                    request_id
+                    if "__verl_recompute_attempt_" in request_id
+                    else uuid4().hex
+                ),
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -289,6 +328,12 @@ class LLMServerClient:
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
+            _verl_recompute_event(
+                "SERVER_RPC_END",
+                logical_request_id=str(request_id),
+                server_id=str(server_id),
+                output_tokens=len(output.token_ids),
+            )
             return output
         finally:
             self._release_server(server_id)
@@ -341,11 +386,28 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+        attempt_id = 0
 
         while True:
+            engine_request_id = (
+                request_id
+                if attempt_id == 0
+                else f"{request_id}__verl_recompute_attempt_{attempt_id}"
+            )
+            if attempt_id > 0:
+                _verl_recompute_event(
+                    "RETRY_SUBMIT",
+                    logical_request_id=str(request_id),
+                    engine_request_id=str(engine_request_id),
+                    attempt_id=attempt_id,
+                    prompt_tokens=len(prompt_ids),
+                    partial_tokens=len(final_output.token_ids),
+                    retry_prefix_tokens=len(prompt_ids) + len(final_output.token_ids),
+                )
+
             # 1. generate tokens
             output = await super().generate(
-                request_id=request_id,
+                request_id=engine_request_id,
                 prompt_ids=prompt_ids + final_output.token_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -395,6 +457,15 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
+            if attempt_id > 0:
+                _verl_recompute_event(
+                    "CLIENT_REABORT",
+                    logical_request_id=str(request_id),
+                    engine_request_id=str(engine_request_id),
+                    attempt_id=attempt_id,
+                    retry_prefix_tokens=len(prompt_ids) + len(final_output.token_ids),
+                )
+            attempt_id += 1
             await asyncio.sleep(1)
 
         final_output.extra_fields["global_steps"] = global_steps
