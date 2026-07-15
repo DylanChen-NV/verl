@@ -647,6 +647,14 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
         print(f"VERL_PIPELINE_EVENT phase=WORKER_GATHER_END pid={__import__('os').getpid()} outputs={len(outputs)}", flush=True)
+        output = self._postprocess(
+            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+        )
+        print(f"VERL_PIPELINE_EVENT phase=WORKER_BATCH_END pid={__import__('os').getpid()} batch={len(output)}", flush=True)
+        return output
+
+    def flush_rollout_traces(self) -> bool:
+        """Flush traces once after generation, without blocking the request pipeline."""
         if RolloutTraceConfig.get_backend() == "mlflow":
             try:
                 flush_trace_async_logging = getattr(
@@ -656,12 +664,8 @@ class AgentLoopWorker:
                     flush_trace_async_logging()
             except Exception:
                 logger.warning("Failed to flush MLflow rollout traces", exc_info=True)
-
-        output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
-        )
-        print(f"VERL_PIPELINE_EVENT phase=WORKER_BATCH_END pid={__import__('os').getpid()} batch={len(output)}", flush=True)
-        return output
+                return False
+        return True
 
     async def _run_agent_loop(
         self,
@@ -1250,6 +1254,13 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    async def flush_rollout_traces(self) -> list[bool]:
+        results = await asyncio.gather(
+            *[worker.flush_rollout_traces.remote() for worker in self.agent_loop_workers],
+            return_exceptions=True,
+        )
+        return [result is True for result in results]
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

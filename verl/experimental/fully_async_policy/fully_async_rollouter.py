@@ -1116,6 +1116,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
 
+            if self.async_rollout_manager is not None:
+                flush_results = await self.async_rollout_manager.flush_rollout_traces()
+                if not all(flush_results):
+                    logger.warning("One or more agent-loop workers failed to flush rollout traces")
+
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
     async def _async_monitor_loop(self):
