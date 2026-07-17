@@ -334,6 +334,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
+            abort_kv_cfg = self.config.actor_rollout_ref.rollout.get("abort_kv_reuse", {})
+            if bool(abort_kv_cfg.get("enabled", False)):
+                await self._load_balancer.wait_abort_kv_reuse_ready.remote()
             await asyncio.sleep(1)
 
         final_output.extra_fields["global_steps"] = global_steps
