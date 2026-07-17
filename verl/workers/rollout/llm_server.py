@@ -106,6 +106,27 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
+        self._abort_kv_reuse_event: asyncio.Event | None = None
+        self._abort_kv_reuse_cycle_id: int | None = None
+
+    def begin_abort_kv_reuse_cycle(self, cycle_id: int) -> None:
+        self._abort_kv_reuse_cycle_id = int(cycle_id)
+        self._abort_kv_reuse_event = asyncio.Event()
+        _verl_recompute_event("RETRY_GATE_CLOSE", dynamic_cycle_id=int(cycle_id))
+
+    async def wait_abort_kv_reuse_ready(self) -> int | None:
+        event = self._abort_kv_reuse_event
+        cycle_id = self._abort_kv_reuse_cycle_id
+        if event is None or cycle_id is None:
+            return None
+        await event.wait()
+        return cycle_id
+
+    def mark_abort_kv_reuse_ready(self, cycle_id: int) -> None:
+        if self._abort_kv_reuse_event is None or self._abort_kv_reuse_cycle_id != int(cycle_id):
+            raise RuntimeError(f"abort KV reuse cycle {cycle_id} was not initialized")
+        self._abort_kv_reuse_event.set()
+        _verl_recompute_event("PUT_VISIBLE_BARRIER", dynamic_cycle_id=int(cycle_id))
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -311,7 +332,7 @@ class LLMServerClient:
         recompute_context = recompute_context or {}
         span_attributes = dict(recompute_context)
         span_attributes["verl.rollout.server_id"] = str(server_id)
-        span_attributes.setdefault("verl.flexkv.put_status", "disabled")
+        span_attributes.setdefault("verl.kv_offload.put_status", "disabled")
         _set_mlflow_attempt_attributes(**span_attributes)
         _verl_recompute_event(
             "LB_AFTER_ACQUIRE",
@@ -335,11 +356,7 @@ class LLMServerClient:
                 server_id=str(server_id),
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=(
-                    request_id
-                    if "__verl_recompute_attempt_" in request_id
-                    else uuid4().hex
-                ),
+                request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -449,7 +466,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 "verl.recompute.is_retry": attempt_id > 0,
                 "verl.recompute.partial_tokens": len(final_output.token_ids),
                 "verl.recompute.retry_prefix_tokens": len(prompt_ids) + len(final_output.token_ids),
-                "verl.flexkv.put_status": os.getenv("VERL_FLEXKV_PUT_STATUS", "disabled"),
+                "verl.kv_offload.put_status": os.getenv("VERL_KV_OFFLOAD_PUT_STATUS", "disabled"),
             }
 
             # 1. generate tokens
@@ -514,6 +531,20 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     retry_prefix_tokens=len(prompt_ids) + len(final_output.token_ids),
                 )
             attempt_id += 1
+            abort_kv_cfg = self.config.actor_rollout_ref.rollout.get("abort_kv_reuse", {})
+            if bool(abort_kv_cfg.get("enabled", False)):
+                _verl_recompute_event(
+                    "RETRY_GATE_ENTER",
+                    logical_request_id=str(request_id),
+                    attempt_id=attempt_id,
+                )
+                cycle_id = await self._load_balancer.wait_abort_kv_reuse_ready.remote()
+                _verl_recompute_event(
+                    "RETRY_GATE_RELEASE" if cycle_id is not None else "RETRY_GATE_BYPASS",
+                    logical_request_id=str(request_id),
+                    attempt_id=attempt_id,
+                    dynamic_cycle_id=cycle_id,
+                )
             await asyncio.sleep(1)
 
         final_output.extra_fields["global_steps"] = global_steps

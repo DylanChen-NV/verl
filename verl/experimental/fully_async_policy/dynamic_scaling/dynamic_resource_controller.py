@@ -71,6 +71,8 @@ class DynamicResourceController:
         num_standalone_replicas: int,
         num_hybrid_replicas: int,
         policy: DynamicScalingPolicyBase | None = None,
+        abort_kv_reuse_enabled: bool = False,
+        abort_kv_reuse_timeout_s: float = 30.0,
     ):
         self.rollouter = rollouter
         self.hybrid_checkpoint_manager = hybrid_checkpoint_manager
@@ -80,6 +82,8 @@ class DynamicResourceController:
         self._only_hybrid: bool = num_standalone_replicas == 0
         self.activate_count: int = 0
         self.deactivate_count: int = 0
+        self.abort_kv_reuse_enabled = abort_kv_reuse_enabled
+        self.abort_kv_reuse_timeout_s = abort_kv_reuse_timeout_s
         self.policy: DynamicScalingPolicyBase = (
             policy if policy is not None else DefaultDynamicScalingPolicy(only_hybrid=self._only_hybrid)
         )
@@ -147,10 +151,20 @@ class DynamicResourceController:
             self._hybrid_active = False
             return
 
-        # Order is critical: remove from LB first so retry loop can't re-route to dying replicas.
+        if self.abort_kv_reuse_enabled:
+            await self.rollouter.begin_abort_kv_reuse_cycle.remote(dynamic_cycle_id)
+
+        # Order is critical: remove from LB first so retry loop cannot re-route to dying replicas.
         await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
-        await self.hybrid_checkpoint_manager.abort_replicas()
-        await self.hybrid_checkpoint_manager.sleep_replicas()
+        await self.hybrid_checkpoint_manager.abort_replicas(
+            checkpoint_kv=self.abort_kv_reuse_enabled,
+            timeout_s=self.abort_kv_reuse_timeout_s,
+        )
+        if self.abort_kv_reuse_enabled:
+            await self.rollouter.mark_abort_kv_reuse_ready.remote(dynamic_cycle_id)
+        await self.hybrid_checkpoint_manager.sleep_replicas(
+            reset_connector=not self.abort_kv_reuse_enabled
+        )
 
         self._hybrid_active = False
         self.deactivate_count += 1
