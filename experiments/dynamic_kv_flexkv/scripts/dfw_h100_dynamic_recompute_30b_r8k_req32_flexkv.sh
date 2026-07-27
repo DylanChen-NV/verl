@@ -8,15 +8,17 @@ export TRAINER_TP=2 TRAINER_PP=2 TRAINER_EP=4 TRAINER_ETP=1 TRAINER_CP=1
 export TRAINER_PPO_MICRO_BSZ=${TRAINER_PPO_MICRO_BSZ:-1} TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ:--1}
 export TRAIN_PROMPT_MINI_BSZ=${TRAIN_PROMPT_MINI_BSZ:-8} REQUIRE_BATCHES=${REQUIRE_BATCHES:-2}
 export PLANNED_TRAINER_STEPS=${PLANNED_TRAINER_STEPS:-5} TOTAL_ROLLOUT_STEPS=${TOTAL_ROLLOUT_STEPS:-80}
-export EXPECTED_MLFLOW_TRACES=${EXPECTED_MLFLOW_TRACES:-120}
+export EXPECTED_LOGICAL_REQUESTS=${EXPECTED_LOGICAL_REQUESTS:-${EXPECTED_MLFLOW_TRACES:-120}}
 export MINIMUM_RETRY_ATTEMPTS=${MINIMUM_RETRY_ATTEMPTS:-16}
 export MAX_PROMPT_LENGTH=1024 MAX_RESPONSE_LENGTH=8192 ACTOR_PPO_MAX_TOKEN_LEN=18432 INFER_PPO_MAX_TOKEN_LEN=27648
 export N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-2}
 export CONCURRENT_SAMPLES_PER_REPLICA=${CONCURRENT_SAMPLES_PER_REPLICA:-32}
 export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32} ROLLOUT_TP=${ROLLOUT_TP:-2}
+export ROLLOUT_IGNORE_EOS=${ROLLOUT_IGNORE_EOS:-True}
 export STALENESS_THRESHOLD=3.0
 export RAY_CLEANUP_SETTLE_SECONDS=${RAY_CLEANUP_SETTLE_SECONDS:-5}
-export GPU_MEMORY_UTILIZATION=0.70 STANDALONE_GPU_MEMORY_UTILIZATION=0.70
+export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.70}
+export STANDALONE_GPU_MEMORY_UTILIZATION=${STANDALONE_GPU_MEMORY_UTILIZATION:-0.70}
 export ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
 export DYNAMIC_DEACTIVATE_RATIO=${DYNAMIC_DEACTIVATE_RATIO:-0.25}
 export VERL_RECOMPUTE_DEACTIVATE_GRACE_S=${VERL_RECOMPUTE_DEACTIVATE_GRACE_S:-0}
@@ -67,7 +69,7 @@ export VLLM_USE_V1=${VLLM_USE_V1:-1}
 export RAY_DEDUP_LOGS=0
 export VERL_RECOMPUTE_TRACE=1
 export VERL_RECOMPUTE_DEACTIVATE_GRACE_S=${VERL_RECOMPUTE_DEACTIVATE_GRACE_S:-2.0}
-export MLFLOW_ENABLE_ASYNC_TRACE_LOGGING=true
+export MLFLOW_ENABLE_ASYNC_TRACE_LOGGING=${MLFLOW_ENABLE_ASYNC_TRACE_LOGGING:-false}
 RUNTIME_PYTHONPATH="${PYDEPS_DIR}:${REPO}:${VLLM_REPO}:${FLEXKV_REPO}:${MLFLOW_SITE}${PYTHONPATH:+:${PYTHONPATH}}"
 export LD_LIBRARY_PATH="${PYDEPS_DIR}/nvidia/nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
@@ -1459,7 +1461,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.enforce_eager=${rollout_enforce_eager} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_model_len=${max_model_len} \
-    actor_rollout_ref.rollout.ignore_eos=True \
+    actor_rollout_ref.rollout.ignore_eos=${ROLLOUT_IGNORE_EOS} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs} \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -1524,7 +1526,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_RECOMPUTE_TRACE="'1'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.VERL_RECOMPUTE_DEACTIVATE_GRACE_S="'${VERL_RECOMPUTE_DEACTIVATE_GRACE_S}'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI}" \
-    +ray_kwargs.ray_init.runtime_env.env_vars.MLFLOW_ENABLE_ASYNC_TRACE_LOGGING="'true'" \
+    +ray_kwargs.ray_init.runtime_env.env_vars.MLFLOW_ENABLE_ASYNC_TRACE_LOGGING="'${MLFLOW_ENABLE_ASYNC_TRACE_LOGGING}'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.RAY_DEDUP_LOGS="'0'" \
     +ray_kwargs.ray_init.runtime_env.env_vars.WANDB_ENTITY="${WANDB_ENTITY}" \
     +ray_kwargs.ray_init.runtime_env.env_vars.WANDB_PROJECT="${WANDB_PROJECT}" \
@@ -1540,7 +1542,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
 python3 "${MLFLOW_DUMP_SCRIPT}" \
   --output-dir "${MLFLOW_OUTPUT_DIR}" \
   --project-name "${MLFLOW_PROJECT}" \
-  --expected-traces "${EXPECTED_MLFLOW_TRACES}" \
+  --expected-logical-requests "${EXPECTED_LOGICAL_REQUESTS}" \
   --expected-server-replicas $(((NNODES_ROLLOUT + NNODES_TRAIN) * NGPUS_PER_NODE / ROLLOUT_TP)) \
   --minimum-retry-attempts "${MINIMUM_RETRY_ATTEMPTS}"
 
