@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 export MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/public_models/verl/Qwen3-30B-A3B
 export MCORE_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/public_models/verl/Qwen3-30B-A3B-mcore-pp2
-export VERL_COMMIT=215fa9884a3b4877d9bf2f1251b25c509a34187a
+export VERL_COMMIT=846799f285478ffa41a698591c5fd070cb5a4b90
 export TRAINER_TP=2 TRAINER_PP=2 TRAINER_EP=4 TRAINER_ETP=1 TRAINER_CP=1
 export TRAINER_PPO_MICRO_BSZ=${TRAINER_PPO_MICRO_BSZ:-1} TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ:--1}
 export TRAIN_PROMPT_MINI_BSZ=${TRAIN_PROMPT_MINI_BSZ:-8} REQUIRE_BATCHES=${REQUIRE_BATCHES:-2}
@@ -18,6 +18,7 @@ export ROLLOUT_IGNORE_EOS=${ROLLOUT_IGNORE_EOS:-True}
 export STALENESS_THRESHOLD=3.0
 export RAY_CLEANUP_SETTLE_SECONDS=${RAY_CLEANUP_SETTLE_SECONDS:-5}
 export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.70}
+export FLEXKV_CPU_CACHE_GB=${FLEXKV_CPU_CACHE_GB:-64}
 export STANDALONE_GPU_MEMORY_UTILIZATION=${STANDALONE_GPU_MEMORY_UTILIZATION:-0.70}
 export ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-True}
 export DYNAMIC_DEACTIVATE_RATIO=${DYNAMIC_DEACTIVATE_RATIO:-0.25}
@@ -89,6 +90,17 @@ export MLFLOW_TRACKING_URI="http://127.0.0.1:${MLFLOW_PORT}"
 mkdir -p "${MLFLOW_RUN_DIR}" "${MLFLOW_ARTIFACT_ROOT}" "${MLFLOW_OUTPUT_DIR}"
 source "${WORKSPACE}/scripts/flexkv_runtime.inc.sh"
 configure_flexkv
+KV_ARGS+=(
+  "actor_rollout_ref.rollout.flexkv_service.auto_start=True"
+  "actor_rollout_ref.rollout.flexkv_service.redis_server_path=${FLEXKV_REDIS_SERVER_PATH:-redis-server}"
+  "actor_rollout_ref.rollout.flexkv_service.expected_gpus_per_node=${NGPUS_PER_NODE:-8}"
+  "actor_rollout_ref.rollout.flexkv_service.cpu_cache_gb=${FLEXKV_CPU_CACHE_GB:-64}"
+  "actor_rollout_ref.rollout.flexkv_service.flexkv_redis_port=${FLEXKV_REDIS_PORT:-6393}"
+  "actor_rollout_ref.rollout.flexkv_service.mooncake_redis_port=${MTE_REDIS_PORT:-6395}"
+  "actor_rollout_ref.rollout.flexkv_service.local_zmq_port_base=${FLEXKV_ZMQ_BASE_PORT:-56800}"
+  "actor_rollout_ref.rollout.flexkv_service.transfer_engine_port_base=${MTE_ENGINE_BASE_PORT:-56900}"
+  "actor_rollout_ref.rollout.flexkv_service.log_dir=${FLEXKV_SERVICE_LOG_DIR:-${WORKSPACE}/logs/ray_services_${RUN_ID}}"
+)
 
 NNODES_TRAIN=${NNODES_TRAIN:-1}
 NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
