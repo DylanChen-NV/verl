@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -20,7 +22,10 @@ from typing import AsyncGenerator, Generator
 from unittest.mock import patch
 
 with patch("importlib.metadata.distributions", return_value=[]):
-    import cupy as cp
+    try:
+        import cupy as cp
+    except ImportError:
+        cp = None
 
 import ray
 import ray.util.collective as collective
@@ -135,7 +140,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def prepare(self) -> MasterMetadata:
         # For master process, use cupy instead of torch to avoid memory register error
         # when `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-        if self.is_master:
+        if self.is_master and cp is not None:
             self.send_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
             self.recv_buf = cp.zeros(self.bucket_size, dtype=cp.uint8)
         else:
@@ -280,7 +285,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
             tensor_meta.offset = offset
             bucket_meta[tensor_meta.name] = tensor_meta
-            send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
+            if cp is not None and not isinstance(send_buf, torch.Tensor):
+                send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
+            else:
+                send_buf[offset : offset + tensor_meta.chunk_size] = chunk
             offset += tensor_meta.chunk_size
 
         # broadcast last bucket

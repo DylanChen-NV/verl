@@ -32,6 +32,23 @@ package_version = get_version(package_name)
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
 
+
+def _ensure_transformers_allowed_layer_types():
+    try:
+        import transformers.configuration_utils as configuration_utils
+    except Exception:
+        return
+
+    if not hasattr(configuration_utils, "ALLOWED_LAYER_TYPES"):
+        configuration_utils.ALLOWED_LAYER_TYPES = [
+            "full_attention",
+            "sliding_attention",
+            "chunked_attention",
+        ]
+
+
+_ensure_transformers_allowed_layer_types()
+
 if package_version is None:
     if not is_sglang_available():
         raise ValueError(

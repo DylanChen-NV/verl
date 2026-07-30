@@ -652,11 +652,26 @@ class AgentLoopWorker:
                 )
             )
         outputs = await asyncio.gather(*tasks)
-
+        print(f"VERL_PIPELINE_EVENT phase=WORKER_GATHER_END pid={__import__('os').getpid()} outputs={len(outputs)}", flush=True)
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
+        print(f"VERL_PIPELINE_EVENT phase=WORKER_BATCH_END pid={__import__('os').getpid()} batch={len(output)}", flush=True)
         return output
+
+    def flush_rollout_traces(self) -> bool:
+        """Flush traces once after generation, without blocking the request pipeline."""
+        if RolloutTraceConfig.get_backend() == "mlflow":
+            try:
+                flush_trace_async_logging = getattr(
+                    RolloutTraceConfig.get_client(), "flush_trace_async_logging", None
+                )
+                if flush_trace_async_logging is not None:
+                    flush_trace_async_logging()
+            except Exception:
+                logger.warning("Failed to flush MLflow rollout traces", exc_info=True)
+                return False
+        return True
 
     async def _run_agent_loop(
         self,
@@ -691,7 +706,10 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            print(f"VERL_PIPELINE_EVENT phase=TRAJECTORY_POSTPROCESS_BEGIN pid={__import__('os').getpid()}", flush=True)
+            result = await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            print(f"VERL_PIPELINE_EVENT phase=TRAJECTORY_POSTPROCESS_END pid={__import__('os').getpid()}", flush=True)
+            return result
 
     def _pad_token_ids(
         self,
@@ -998,7 +1016,16 @@ class AgentLoopWorker:
                     non_tensor_batch=non_tensor_batch,
                 )
                 selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
+                print(
+                    f"VERL_REWARD_EVENT phase=AGENT_REWARD_BEGIN pid={__import__('os').getpid()} "
+                    f"handle={selected_reward_loop_worker_handle}",
+                    flush=True,
+                )
                 result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+                print(
+                    f"VERL_REWARD_EVENT phase=AGENT_REWARD_END pid={__import__('os').getpid()}",
+                    flush=True,
+                )
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
@@ -1233,6 +1260,13 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    async def flush_rollout_traces(self) -> list[bool]:
+        results = await asyncio.gather(
+            *[worker.flush_rollout_traces.remote() for worker in self.agent_loop_workers],
+            return_exceptions=True,
+        )
+        return [result is True for result in results]
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}

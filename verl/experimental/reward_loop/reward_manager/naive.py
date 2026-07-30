@@ -32,6 +32,10 @@ class NaiveRewardManager(RewardManagerBase):
         self.reward_model_tokenizer = reward_model_tokenizer
 
     async def run_single(self, data: DataProto) -> dict:
+        print(
+            f"VERL_REWARD_EVENT phase=REWARD_RUN_BEGIN pid={__import__('os').getpid()}",
+            flush=True,
+        )
         data = data[-1:]  # for multi-sequence outputs, we only compute reward based on the last sequence
         data_item = data[0]
         response_ids = data_item.batch["responses"]
@@ -53,6 +57,10 @@ class NaiveRewardManager(RewardManagerBase):
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+        )
+        print(
+            f"VERL_REWARD_EVENT phase=REWARD_DECODE_END pid={__import__('os').getpid()}",
+            flush=True,
         )
 
         extra_reward_kwargs = (
@@ -95,5 +103,9 @@ class NaiveRewardManager(RewardManagerBase):
             reward_extra_info["acc"] = score
 
         reward = score
+        print(
+            f"VERL_REWARD_EVENT phase=REWARD_SCORE_END pid={__import__('os').getpid()} score={reward}",
+            flush=True,
+        )
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}

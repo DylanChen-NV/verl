@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from pprint import pprint
@@ -75,6 +76,31 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _verl_recompute_server_event(phase: str, request_id: str, monotonic_ns: int, **fields) -> None:
+    marker = "__verl_recompute_attempt_"
+    if os.getenv("VERL_RECOMPUTE_TRACE", "0") != "1" or marker not in request_id:
+        return
+    logical_request_id, raw_attempt = request_id.rsplit(marker, 1)
+    try:
+        attempt_id = int(raw_attempt)
+    except ValueError:
+        return
+    payload = {
+        "phase": phase,
+        "logical_request_id": logical_request_id,
+        "engine_request_id": request_id,
+        "attempt_id": attempt_id,
+        "monotonic_ns": monotonic_ns,
+        "wall_ns": time.time_ns(),
+        "node_id": socket.gethostname(),
+        "replica_id": os.getenv("VERL_REPLICA_RANK", "unknown"),
+        "rollout_node_rank": os.getenv("VERL_ROLLOUT_NODE_RANK", "unknown"),
+        "rollout_mode": os.getenv("VERL_ROLLOUT_MODE", "unknown"),
+        **fields,
+    }
+    print("VERL_RECOMPUTE_EVENT " + json.dumps(payload, sort_keys=True), flush=True)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -125,6 +151,8 @@ class vLLMHttpServer:
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        os.environ["VERL_ROLLOUT_NODE_RANK"] = str(node_rank)
+        os.environ["VERL_ROLLOUT_MODE"] = str(getattr(rollout_mode, "value", rollout_mode))
         flexkv_instance_num = int(os.getenv("FLEXKV_INSTANCE_NUM", "1"))
         if flexkv_instance_num > 1:
             os.environ["FLEXKV_INSTANCE_ID"] = str(replica_rank % flexkv_instance_num)
@@ -653,6 +681,16 @@ class vLLMHttpServer:
                 )
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
+            retry_request = "__verl_recompute_attempt_" in request_id
+            submit_ns = time.monotonic_ns()
+            if retry_request:
+                _verl_recompute_server_event(
+                    "SUBMIT",
+                    request_id,
+                    submit_ns,
+                    retry_prefix_tokens=len(prompt_ids),
+                    measurement_source="enginecore_scheduler",
+                )
             generator = self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -661,10 +699,21 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            # Get final response
+            # First output closes the queue-excluded recovery interval whose start
+            # is emitted by EngineCore when the request is first scheduled.
             final_res: Optional[RequestOutput] = None
+            first_output_seen = False
             async for output in generator:
                 final_res = output
+                if retry_request and not first_output_seen:
+                    first_output_seen = True
+                    observed_ns = time.monotonic_ns()
+                    event_fields = {
+                        "retry_prefix_tokens": len(prompt_ids),
+                        "measurement_source": "enginecore_scheduler",
+                    }
+                    phase = "FIRST_OUTPUT" if output.outputs else "REABORT"
+                    _verl_recompute_server_event(phase, request_id, observed_ns, **event_fields)
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
