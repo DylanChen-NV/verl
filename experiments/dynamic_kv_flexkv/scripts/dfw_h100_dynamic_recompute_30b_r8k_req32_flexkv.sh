@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 export MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/public_models/verl/Qwen3-30B-A3B
 export MCORE_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/ziqingc/05_claude_ws/public_models/verl/Qwen3-30B-A3B-mcore-pp2
-export VERL_COMMIT=846799f285478ffa41a698591c5fd070cb5a4b90
+export VERL_COMMIT=2a4921570177ea032aa1e567f9d728d8acec072e
 export TRAINER_TP=2 TRAINER_PP=2 TRAINER_EP=4 TRAINER_ETP=1 TRAINER_CP=1
 export TRAINER_PPO_MICRO_BSZ=${TRAINER_PPO_MICRO_BSZ:-1} TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ:--1}
 export TRAIN_PROMPT_MINI_BSZ=${TRAIN_PROMPT_MINI_BSZ:-8} REQUIRE_BATCHES=${REQUIRE_BATCHES:-2}
