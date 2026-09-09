@@ -18,8 +18,11 @@ Utility classes for manage and request LLM servers:
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -38,6 +41,18 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _token_digest(token_ids) -> str:
+    values = np.asarray(token_ids, dtype=np.int64)
+    return hashlib.sha256(values.tobytes()).hexdigest()[:16]
+
+
+def _recompute_event(phase: str, **fields: Any) -> None:
+    if os.getenv("VERL_RECOMPUTE_TRACE", "0") != "1":
+        return
+    payload = {"phase": phase, "wall_ns": time.time_ns(), **fields}
+    print("VERL_RECOMPUTE_EVENT " + json.dumps(payload, sort_keys=True), flush=True)
 
 
 class LLMServerClient:
@@ -118,6 +133,7 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        recompute_attempt_id = kwargs.pop("_recompute_attempt_id", None)
         server_id, server = await self._acquire_server(
             request_id,
             prompt_ids=prompt_ids,
@@ -127,6 +143,16 @@ class LLMServerClient:
             audio_data=audio_data,
             mm_processor_kwargs=mm_processor_kwargs,
             **kwargs,
+        )
+        backend_request_id = self._vllm_request_id(request_id)
+        _recompute_event(
+            "BACKEND_DISPATCH",
+            logical_request_id=str(request_id),
+            backend_request_id=backend_request_id,
+            attempt_id=recompute_attempt_id,
+            server_id=str(server_id),
+            prefix_tokens=len(prompt_ids),
+            token_digest=_token_digest(prompt_ids),
         )
         try:
             multimodal_kwargs = {}
@@ -140,7 +166,7 @@ class LLMServerClient:
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                request_id=backend_request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -152,6 +178,8 @@ class LLMServerClient:
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
+            output.extra_fields["rollout_server_id"] = str(server_id)
+            output.extra_fields["backend_request_id"] = backend_request_id
             return output
         finally:
             self._release_server(
@@ -277,6 +305,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         # must carry it forward explicitly or the consumer sees 0. Take the first
         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
         num_cached_tokens = None
+        attempt_id = 0
 
         while True:
             # 1. generate tokens
@@ -288,7 +317,28 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 video_data=video_data,
                 audio_data=audio_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                _recompute_attempt_id=attempt_id,
                 **kwargs,
+            )
+
+            _recompute_event(
+                "ATTEMPT_RESULT",
+                logical_request_id=str(request_id),
+                backend_request_id=output.extra_fields.get("backend_request_id"),
+                attempt_id=attempt_id,
+                server_id=output.extra_fields.get("rollout_server_id"),
+                stop_reason=output.stop_reason,
+                prompt_tokens=len(prompt_ids),
+                partial_tokens_before_attempt=len(final_output.token_ids),
+                attempt_output_tokens=len(output.token_ids),
+                cumulative_output_digest=_token_digest(final_output.token_ids + output.token_ids),
+                retry_prefix_tokens=len(prompt_ids) + len(final_output.token_ids),
+                max_tokens=original_max_tokens,
+                forward_entry_ns=output.extra_fields.get("sglang_forward_entry_ns"),
+                first_output_ns=output.extra_fields.get("sglang_prefill_finished_ns"),
+                queue_time_s=output.extra_fields.get("sglang_queue_time_s"),
+                cached_tokens=output.extra_fields.get("sglang_cached_tokens"),
+                replica_rank=output.extra_fields.get("sglang_replica_rank"),
             )
 
             # 2. merge output into final_output
@@ -333,6 +383,17 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 should_retry = False
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
+
+            _recompute_event(
+                "ABORTED",
+                logical_request_id=str(request_id),
+                backend_request_id=output.extra_fields.get("backend_request_id"),
+                attempt_id=attempt_id,
+                partial_tokens=len(final_output.token_ids),
+                server_id=output.extra_fields.get("rollout_server_id"),
+                replica_rank=output.extra_fields.get("sglang_replica_rank"),
+            )
+            attempt_id += 1
 
             abort_kv_cfg = self.config.actor_rollout_ref.rollout.get("abort_kv_reuse", {})
             if bool(abort_kv_cfg.get("enabled", False)):

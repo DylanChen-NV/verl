@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -560,6 +561,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Args:
             batch_dict: Raw data dictionary
         """
+        step_param_version = self.current_param_version
+        if os.getenv("VERL_RECOMPUTE_TRACE", "0") == "1":
+            print(
+                "VERL_RECOMPUTE_EVENT "
+                + json.dumps(
+                    {"phase": "STEP_BEGIN", "wall_ns": time.time_ns(), "global_steps": step_param_version},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
         # reward message
@@ -609,6 +620,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             rollout_reset_timing_raw = await self._fit_update_weights()
             self._fit_dump_data(batch)
             self._record_train_resource_utilization(allocated_time=time.time() - _allocated_start)
+
+        if os.getenv("VERL_RECOMPUTE_TRACE", "0") == "1":
+            print(
+                "VERL_RECOMPUTE_EVENT "
+                + json.dumps(
+                    {
+                        "phase": "STEP_END",
+                        "wall_ns": time.time_ns(),
+                        "global_steps": step_param_version,
+                        "step_seconds": self.timing_raw.get("step"),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
         await self._fit_validate()
         self._fit_save_checkpoint()

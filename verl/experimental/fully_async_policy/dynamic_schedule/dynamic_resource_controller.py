@@ -26,6 +26,8 @@ Deactivate (order is critical):
   3. sleep_replicas   – release KV cache + offload weights, return GPU to training.
 """
 
+import json
+import os
 import time
 
 import ray
@@ -46,6 +48,13 @@ __all__ = [
     "build_policy",
     "register_policy",
 ]
+
+
+def _recompute_event(phase: str, **fields) -> None:
+    if os.getenv("VERL_RECOMPUTE_TRACE", "0") != "1":
+        return
+    payload = {"phase": phase, "wall_ns": time.time_ns(), **fields}
+    print("VERL_RECOMPUTE_EVENT " + json.dumps(payload, sort_keys=True), flush=True)
 
 
 class DynamicResourceController:
@@ -133,6 +142,7 @@ class DynamicResourceController:
         """Add hybrid replicas to the LB and resume generation (weight sync must be done first)."""
         print(f"[DynamicResourceController] Activating hybrid replicas at step {global_steps}")
         start = time.time()
+        _recompute_event("ACTIVATE_BEGIN", global_steps=global_steps)
 
         hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
@@ -147,6 +157,7 @@ class DynamicResourceController:
 
         self._hybrid_active = True
         self.activate_count += 1
+        _recompute_event("ACTIVATE_END", global_steps=global_steps)
         print(
             f"[DynamicResourceController] Activated {len(hybrid_resource_ids)} replicas "
             f"in {time.time() - start:.2f}s (count={self.activate_count})"
@@ -157,6 +168,7 @@ class DynamicResourceController:
         print(f"[DynamicResourceController] Deactivating hybrid replicas at step {global_steps}")
         start = time.time()
         dynamic_cycle_id = self.deactivate_count + 1
+        _recompute_event("DEACTIVATE_BEGIN", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
 
         hybrid_replicas_dict = ray.get(self.rollouter.get_all_hybrid_replicas.remote())
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
@@ -170,18 +182,24 @@ class DynamicResourceController:
 
         # Order is critical: remove from LB first so retry loop cannot re-route to dying replicas.
         await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
+        _recompute_event("ABORT_REPLICAS_BEGIN", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
         await self.hybrid_checkpoint_manager.abort_replicas(
             checkpoint_kv=self.abort_kv_reuse_enabled,
             timeout_s=self.abort_kv_reuse_timeout_s,
         )
+        _recompute_event("ABORT_REPLICAS_END", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
         if self.abort_kv_reuse_enabled:
             await self.rollouter.mark_abort_kv_reuse_ready.remote(dynamic_cycle_id)
+            _recompute_event("ABORT_KV_REUSE_READY", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
+        _recompute_event("SLEEP_BEGIN", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
         await self.hybrid_checkpoint_manager.sleep_replicas(
             reset_connector=not self.abort_kv_reuse_enabled
         )
+        _recompute_event("SLEEP_END", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
 
         self._hybrid_active = False
         self.deactivate_count += 1
+        _recompute_event("DEACTIVATE_END", dynamic_cycle_id=dynamic_cycle_id, global_steps=global_steps)
         print(
             f"[DynamicResourceController] Deactivated {len(hybrid_resource_ids)} replicas "
             f"in {time.time() - start:.2f}s (count={self.deactivate_count})"

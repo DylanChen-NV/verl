@@ -717,6 +717,15 @@ class SGLangHttpServer:
                 )
 
         extra_fields = {"global_steps": self.global_steps}
+        extra_fields["sglang_replica_rank"] = self.replica_rank
+        if meta_info.get("forward_entry_time") is not None:
+            extra_fields["sglang_forward_entry_ns"] = round(float(meta_info["forward_entry_time"]) * 1e9)
+        if meta_info.get("prefill_finished_time") is not None:
+            extra_fields["sglang_prefill_finished_ns"] = round(float(meta_info["prefill_finished_time"]) * 1e9)
+        if meta_info.get("queue_time") is not None:
+            extra_fields["sglang_queue_time_s"] = float(meta_info["queue_time"])
+        if meta_info.get("cached_tokens") is not None:
+            extra_fields["sglang_cached_tokens"] = int(meta_info["cached_tokens"])
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,

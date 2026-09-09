@@ -14,6 +14,7 @@
 
 import asyncio
 import collections
+import json
 import logging
 import os
 import time
@@ -633,6 +634,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"{timing_raw['dynamic_resource/rollout_resource_utilization']:.4f} "
                 f"recent_history(last {self._STEP_HISTORY_SIZE} steps): {list(self._step_samples_history)}"
             )
+            if os.getenv("VERL_RECOMPUTE_TRACE", "0") == "1":
+                print(
+                    "VERL_RECOMPUTE_EVENT "
+                    + json.dumps(
+                        {
+                            "phase": "ROLLOUT_WINDOW",
+                            "wall_ns": time.time_ns(),
+                            "completed_steps": self._completed_steps,
+                            "active_seconds": rollout_active_time,
+                            "version_seconds": rollout_version_time,
+                            "generated_samples": timing_raw["fully_async/rollouter/step_generated_samples"],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             self.step_start_time = time.time()
 
         return timing_raw
