@@ -1016,6 +1016,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
+        if self.config.actor_rollout_ref.rollout.get("full_determinism", False):
+            # AgentLoop's default deterministic IDs restart at det-0 for every
+            # streaming sample. Give each response a stable process-wide ordinal
+            # so concurrent Fully Async samples cannot reuse a backend request ID.
+            sample_index = int(rollout_sample.sample_id.rsplit("_", 1)[1])
+            samples_per_epoch = self.total_rollout_steps + 1
+            response_stride = int(self.config.actor_rollout_ref.rollout.n)
+            sample_ordinal = rollout_sample.epoch * samples_per_epoch + sample_index
+            start = sample_ordinal * response_stride
+            rollout_sample.full_batch.non_tensor_batch["priority"] = np.arange(
+                start, start + len(rollout_sample.full_batch), dtype=np.int64
+            )
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
 
         rollout_sample.full_batch = ret
