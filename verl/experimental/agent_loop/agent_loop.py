@@ -28,6 +28,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -74,6 +75,17 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _trajectory_sampling_seed(base_seed: int, trajectory: dict[str, Any]) -> int:
+    """Derive a stable int64 seed for one logical rollout trajectory."""
+    identity = "\x1f".join(
+        str(trajectory[key]) for key in ("step", "sample_index", "rollout_n", "validate")
+    )
+    digest = hashlib.blake2b(
+        f"{int(base_seed)}\x1f{identity}".encode(), digest_size=8, person=b"verl-rollout"
+    ).digest()
+    return int.from_bytes(digest, "little") & ((1 << 63) - 1)
 
 
 class AgentLoopMetrics(BaseModel):
@@ -614,6 +626,10 @@ class AgentLoopWorker:
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
             sample_sampling_params = dict(sampling_params)
+            if config.name == "sglang" and config.full_determinism:
+                sample_sampling_params["sampling_seed"] = _trajectory_sampling_seed(
+                    config.seed, trajectory_info[i]
+                )
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
             tasks.append(

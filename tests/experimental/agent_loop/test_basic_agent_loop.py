@@ -23,6 +23,7 @@ from transformers.utils import get_json_schema
 
 from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
 from verl.experimental.agent_loop import get_trajectory_info
+from verl.experimental.agent_loop.agent_loop import _trajectory_sampling_seed
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -408,6 +409,22 @@ async def test_get_trajectory_info():
     trajectory_info = await get_trajectory_info(step, index, validate=False)
 
     assert trajectory_info == expected_info
+
+
+def test_trajectory_sampling_seed_is_stable_and_unique():
+    base = {"step": 10, "sample_index": 3, "validate": False}
+    seeds = [
+        _trajectory_sampling_seed(42, {**base, "rollout_n": rollout_n})
+        for rollout_n in range(8)
+    ]
+
+    assert len(set(seeds)) == len(seeds)
+    assert seeds == [
+        _trajectory_sampling_seed(42, {**base, "rollout_n": rollout_n})
+        for rollout_n in range(8)
+    ]
+    assert all(0 <= seed < 1 << 63 for seed in seeds)
+    assert seeds[0] != _trajectory_sampling_seed(43, {**base, "rollout_n": 0})
 
 
 # ──────────────────────────────────────────────────────────────────────

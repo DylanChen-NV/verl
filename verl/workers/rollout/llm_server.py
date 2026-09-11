@@ -153,6 +153,7 @@ class LLMServerClient:
             server_id=str(server_id),
             prefix_tokens=len(prompt_ids),
             token_digest=_token_digest(prompt_ids),
+            sampling_seed=sampling_params.get("sampling_seed"),
         )
         try:
             multimodal_kwargs = {}
