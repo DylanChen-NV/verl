@@ -96,3 +96,24 @@ class FixedRatioDynamicSchedulePolicy(DynamicSchedulePolicyBase):
             )
         except Exception as e:
             print(f"[FixedRatioDynamicSchedulePolicy] request_rebalance failed at step {global_steps}: {e}")
+
+
+@register_policy("fixed_ratio_every_step")
+class FixedRatioEveryStepDynamicSchedulePolicy(FixedRatioDynamicSchedulePolicy):
+    """Controlled-benchmark policy with a fixed ratio and one switch per step.
+
+    Hybrid replicas are unconditionally activated after each parameter-sync
+    step. Since :meth:`should_deactivate` returns ``is_hybrid_active``, every
+    following training step deactivates them after the fixed sample threshold.
+    This removes the adaptive ratio and cost/benefit activation feedback from
+    A/B/C comparisons; it is not intended as a production scheduling policy.
+    """
+
+    def should_activate_after_step(
+        self, global_steps: int, is_hybrid_active: bool, ctx: DynamicScheduleContext
+    ) -> bool:
+        print(
+            f"[FixedRatioEveryStepDynamicSchedulePolicy] step={global_steps} "
+            f"forcing activation for next step (deactivate_ratio={self.deactivate_ratio:.3f})"
+        )
+        return True
